@@ -633,7 +633,7 @@ input[type="range"]::-webkit-slider-thumb {
 #l-upbar { margin-top: 10px; }
 #view-llm .seg { margin-top: 6px; }
 #view-llm .list { margin-bottom: 16px; }
-#l-pick.is-disabled { opacity: 0.4; pointer-events: none; }
+#l-pick.is-disabled { opacity: 0.4; cursor: not-allowed; }
 
 /* ------------------------------------------------------------ pool */
 

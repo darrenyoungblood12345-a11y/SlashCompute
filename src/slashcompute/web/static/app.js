@@ -781,7 +781,11 @@ function renderLlm() {
   const up_ = l.upload;
   $("#l-upbar").hidden = !up_;
   if (up_) $("#l-upbar i").style.width = `${Math.round(up_.pct * 100)}%`;
-  $("#l-pick").classList.toggle("is-disabled", !!up_ || !up || unsupported);
+  // Why uploading is unavailable right now; a click explains it instead of doing nothing.
+  const pickWhy = up_ ? "An upload is already running." : unsupported ? OUTDATED_COORDINATOR
+    : !up ? "Start or join a pool first." : "";
+  $("#l-pick").classList.toggle("is-disabled", !!pickWhy);
+  $("#l-pick").dataset.why = pickWhy;
 
   setTag("#l-pipe-tag", pipe ? pipe.state : "None", pipe && pipe.state === "active" ? "ok" : "");
   renderOnce("llm-pipe", [pipe || null, !!l.model], $("#l-pipe"), () => pipe ? `
@@ -1338,6 +1342,12 @@ $("#l-mem").addEventListener("change", async (e) => {
   render();
 });
 $("#l-dir").addEventListener("change", (e) => saveSettings({ models_dir: e.target.value.trim() || "~/models" }));
+$("#l-pick").addEventListener("click", (e) => {
+  const why = e.currentTarget.dataset.why;
+  if (!why) return;
+  e.preventDefault();   // keep the file picker closed and say why
+  setMsg("#l-upmsg", why, "bad");
+});
 $("#l-file").addEventListener("change", (e) => {
   const f = e.target.files[0];
   e.target.value = "";

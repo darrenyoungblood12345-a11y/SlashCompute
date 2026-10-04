@@ -72,6 +72,18 @@ def _shell(tmp_path, **kw):
     return app, launcher, spawned
 
 
+def test_unavailable_upload_button_explains_itself(tmp_path):
+    # A disabled "Upload GGUF" used to swallow clicks (pointer-events: none); it must say why.
+    app, _, _ = _shell(tmp_path)
+    with TestClient(app, base_url=SHELL) as c:
+        css = c.get("/static/app.css").text
+        js = c.get("/static/app.js").text
+    assert "#l-pick.is-disabled { opacity: 0.4; cursor: not-allowed; }" in css
+    assert "pointer-events: none" not in css.split("#l-pick.is-disabled", 1)[1].split("}", 1)[0]
+    assert '$("#l-pick").dataset.why = pickWhy;' in js
+    assert 'setMsg("#l-upmsg", why, "bad");' in js
+
+
 def test_index_and_css(tmp_path):
     app, _, _ = _shell(tmp_path)
     with TestClient(app, base_url=SHELL) as c:
