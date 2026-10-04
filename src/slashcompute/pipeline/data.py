@@ -49,10 +49,11 @@ def load_examples(path: str | Path, model_path: Optional[str | Path], max_seq_le
                 tokenizer = load_tokenizer(resolve_model_path(str(model_path)))
             toks, start = _tokenize(tokenizer, row)
         toks = toks[: max_seq_len + 1]
-        if len(toks) >= 2:
-            examples.append(Example(toks, min(start, len(toks) - 1)))
+        # drop rows whose completion was truncated away, else prompt tokens get trained on
+        if len(toks) >= 2 and start < len(toks):
+            examples.append(Example(toks, start))
     if not examples:
-        raise ValueError(f"no usable examples in {path}")
+        raise ValueError(f"no usable examples in {path} (need a completion token within max_seq_len={max_seq_len})")
     return examples
 
 
