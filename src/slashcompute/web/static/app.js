@@ -784,6 +784,8 @@ function renderLlm() {
   // Why uploading is unavailable right now; a click explains it instead of doing nothing.
   const pickWhy = up_ ? "An upload is already running." : unsupported ? OUTDATED_COORDINATOR
     : !up ? "Start or join a pool first." : "";
+  const lastWhy = $("#l-pick").dataset.why;
+  if (lastWhy && lastWhy !== pickWhy && $("#l-upmsg").textContent === lastWhy) setMsg("#l-upmsg", "", "");
   $("#l-pick").classList.toggle("is-disabled", !!pickWhy);
   $("#l-pick").dataset.why = pickWhy;
 

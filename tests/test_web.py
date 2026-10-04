@@ -82,6 +82,8 @@ def test_unavailable_upload_button_explains_itself(tmp_path):
     assert "pointer-events: none" not in css.split("#l-pick.is-disabled", 1)[1].split("}", 1)[0]
     assert '$("#l-pick").dataset.why = pickWhy;' in js
     assert 'setMsg("#l-upmsg", why, "bad");' in js
+    # the explanation goes away once the reason does (e.g. after switching to a pool with LLMs)
+    assert 'textContent === lastWhy) setMsg("#l-upmsg", "", "");' in js
 
 
 def test_index_and_css(tmp_path):
