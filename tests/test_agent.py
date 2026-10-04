@@ -177,6 +177,61 @@ async def test_agent_reconnects_when_handling_a_message_raises_an_http_error(tmp
         server.close()
 
 
+def _assignment():
+    from slashcompute.common.protocol import LoraFinetuneSpec, StageAssignment
+
+    return StageAssignment(
+        job_id="j", epoch=1, stage_idx=0, num_stages=1, layer_start=0, layer_end=8,
+        num_layers=8, spec=LoraFinetuneSpec(dataset_path="dataset.jsonl", steps=100),
+        checkpoint_every=25, verify_ring_size=8, resume_step=25,
+    )
+
+
+async def test_missing_sandbox_fails_the_stage_not_the_daemon(tmp_path, monkeypatch):
+    """sandbox-exec vanishing used to raise out of run(): the daemon stopped, the stage never ended."""
+    from slashcompute.agent import sandbox
+    from slashcompute.agent.daemon import AgentOptions, Daemon
+    from slashcompute.common.protocol import Welcome, dump, parse_agent_message
+
+    monkeypatch.setattr("slashcompute.agent.daemon.benchmark", _fake_profile)
+    monkeypatch.setattr("slashcompute.agent.daemon.unavailable_reason", lambda: "")
+    monkeypatch.setattr(sandbox.shutil, "which", lambda _: None)
+    finished = asyncio.Future()
+
+    async def on_register(ws, n):
+        await ws.send(dump(Welcome(node_id="x", heartbeat_interval_s=30)))
+        await ws.send(dump(_assignment()))
+        async for raw in ws:
+            msg = parse_agent_message(raw)
+            if msg.type == "stage_finished" and not finished.done():
+                finished.set_result(msg)
+
+    server, url, count = await _fake_coordinator(on_register)
+    daemon = Daemon(AgentOptions(url=url, home=tmp_path, localhost=True, sandbox=True))
+    running = asyncio.create_task(daemon.run())
+    try:
+        msg = await asyncio.wait_for(finished, 10)
+        assert msg.reason == "error" and not msg.fatal and msg.last_step == 25
+        assert "unsandboxed" in msg.detail
+        assert not running.done() and count["n"] == 1 and daemon.status == "idle"
+    finally:
+        await daemon.shutdown()
+        await asyncio.wait_for(running, 5)
+        server.close()
+
+
+async def test_agent_refuses_to_start_when_the_sandbox_is_unavailable(tmp_path, monkeypatch):
+    from slashcompute.agent import sandbox
+    from slashcompute.agent.daemon import AgentOptions, Daemon
+
+    monkeypatch.setattr("slashcompute.agent.daemon.benchmark", _fake_profile)
+    monkeypatch.setattr(sandbox.shutil, "which", lambda _: None)
+    opt = AgentOptions(url="http://127.0.0.1:9640", home=tmp_path, localhost=True, sandbox=True)
+    with pytest.raises(SystemExit, match="no-sandbox"):
+        await asyncio.wait_for(Daemon(opt).run(), 5)
+    assert opt.paths.read_pid() is None
+
+
 # ------------------------------------------------------------ verification
 
 

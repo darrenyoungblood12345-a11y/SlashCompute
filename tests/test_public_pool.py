@@ -323,6 +323,20 @@ def test_unassigned_node_cannot_bill_another_users_job(victim_job):
     assert client.get(f"/jobs/{asg.job_id}").json()["spent_flops"] == 1e9
 
 
+def test_nan_step_usage_keeps_the_node_connected(victim_job):
+    """A NaN FLOP count used to hit a SQLite NOT NULL error and drop the stage holder."""
+    client, core, asg, honest, *_ = victim_job
+    nan_step = P.StepMetrics(
+        job_id=asg.job_id, epoch=asg.epoch, stage_idx=0, step=1, loss=0.1,
+        in_digest="x", out_digest="y", usage=_usage(0.0)).model_dump_json()
+    honest.send_text(nan_step.replace('"flops":0.0', '"flops":NaN'))
+    honest.send_text(P.dump(P.StepMetrics(
+        job_id=asg.job_id, epoch=asg.epoch, stage_idx=0, step=1, loss=0.1,
+        in_digest="x", out_digest="y", usage=_usage(1e9))))
+    _flush(core, honest, "honest")
+    assert client.get(f"/jobs/{asg.job_id}").json()["spent_flops"] == 1e9
+
+
 @pytest.mark.parametrize("reason", ["error", "done"])
 def test_unassigned_node_cannot_end_another_users_job(victim_job, reason):
     client, core, asg, honest, bad, _ = victim_job

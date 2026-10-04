@@ -20,7 +20,7 @@ from pydantic import BaseModel, ValidationError
 from slashcompute.agent.benchmark import benchmark
 from slashcompute.agent.http import CoordHTTP
 from slashcompute.agent.paths import AgentPaths, claim_data_port, resolve_data_host
-from slashcompute.agent.sandbox import sandbox_enabled, wrap_command
+from slashcompute.agent.sandbox import sandbox_enabled, unavailable_reason, wrap_command
 from slashcompute.agent.verify import run_canary, run_replay
 from slashcompute.agent.worker import StageSession, WorkerContext, run_stage
 from slashcompute.common.config import EngineConfig
@@ -141,6 +141,8 @@ class Daemon:
 
     async def run(self) -> None:
         opt = self.opt
+        if opt.sandbox and (why := unavailable_reason()):
+            raise SystemExit(why)        # don't join a pool whose work we would refuse to run
         opt.paths.write_pid()
         self._write_status()
         loop = asyncio.get_running_loop()
@@ -260,7 +262,16 @@ class Daemon:
         self._write_status()
         job_dir = self.opt.paths.job_dir(asg.job_id, asg.epoch)
         if self.opt.sandbox:
-            await self._start_sandboxed(asg, job_dir)
+            try:
+                await self._start_sandboxed(asg, job_dir)
+            except (RuntimeError, OSError) as e:     # sandbox gone, or the worker would not spawn
+                log.error("could not start the sandboxed worker: %s", e)
+                self.status, self.job_id, self.epoch = "idle", None, None
+                self._write_status()
+                await self.send(StageFinished(
+                    job_id=asg.job_id, epoch=asg.epoch, stage_idx=asg.stage_idx,
+                    reason="error", last_step=asg.resume_step, detail=str(e),
+                ))
             return
         session = StageSession()
         session.assignment = asg

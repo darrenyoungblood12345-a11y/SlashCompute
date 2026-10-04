@@ -216,7 +216,7 @@ class Credits:
 
     def consume_job(self, job_id: str, flops: float) -> float:
         """Charge a job's reserve. Returns FLOPs actually charged."""
-        if flops <= 0:
+        if not math.isfinite(flops) or flops <= 0:
             return 0.0
         with self._spend_lock, self.db.session() as s:
             acct = s.get(JobAccount, job_id)

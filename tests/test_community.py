@@ -1280,3 +1280,53 @@ def test_http_admin_flags_reject_string_booleans(env):
 
 
 # --------------------------------------------------------------------------- engine hooks
+
+
+@pytest.mark.parametrize("bad", [
+    {"flops": float("nan")}, {"flops": float("inf")}, {"flops": -1e9}, {"wall_s": float("nan")},
+])
+def test_step_with_insane_usage_is_ignored(core, bad):
+    """NaN used to raise an IntegrityError (dropping the node); inf billed the whole reserve."""
+    tiny_model, tiny_dataset = core._tiny
+    user, token = _account(core.auth)
+    core.auth.accept_terms(user)
+    core.credits.contribute(user.id, 1e12, 0)
+    job = core.submit(_spec(tiny_model, tiny_dataset))
+    core.credits.reserve_job(user.id, job.id, 5e9)
+    job.current = EpochState(epoch=1, plans=[])
+    job.row.status = "running"
+
+    async def send(_):
+        return None
+
+    asyncio.run(core.on_register(P.Register(
+        node_id="n1", name="mac", device=_device(), data_host="127.0.0.1",
+        data_port=9700, gpu_percent=50, session_token=token,
+    ), send))
+    usage = _usage().model_copy(update=bad)
+    asyncio.run(core._on_step("n1", P.StepMetrics(
+        job_id=job.id, epoch=1, stage_idx=0, step=1, loss=1.0,
+        in_digest="in", out_digest="out", usage=usage,
+    )))
+    assert core.credits.lifetime_spent(user.id) == 0.0
+    assert core.credits.lifetime_earned(user.id) == pytest.approx(1e12)
+    assert core.ledger.job_records(job.id) == []
+    assert job.row.status == "running"
+
+
+def test_consume_job_ignores_non_finite_flops(core):
+    user, _ = _account(core.auth)
+    core.credits.contribute(user.id, 1e12, 0)
+    core.credits.reserve_job(user.id, "j", 5e9)
+    assert core.credits.consume_job("j", float("inf")) == 0.0
+    assert core.credits.consume_job("j", float("nan")) == 0.0
+    assert core.credits.job_account("j").spent_flops == 0.0
+
+
+def test_a_message_that_raises_does_not_escape_handle(core, monkeypatch):
+    """An unexpected error handling one message used to drop the node's websocket."""
+    def boom(*_):
+        raise RuntimeError("bug")
+
+    monkeypatch.setattr(core.registry, "heartbeat", boom)
+    asyncio.run(core.handle("n1", P.Heartbeat(node_id="n1", status="idle")))

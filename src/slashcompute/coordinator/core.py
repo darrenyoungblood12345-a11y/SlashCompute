@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import shutil
 import uuid
 from pathlib import Path
@@ -17,7 +18,7 @@ from sqlmodel import select
 from slashcompute.common.config import EngineConfig
 from slashcompute.common.protocol import (
     CancelStage, DrainNotice, Heartbeat, Register, StageFinished, StageReady, StepMetrics,
-    VerifyBundleReady, VerifyResult, Welcome,
+    UsageSample, VerifyBundleReady, VerifyResult, Welcome,
 )
 from slashcompute.community.auth import Auth
 from slashcompute.community.credits import Credits
@@ -35,6 +36,10 @@ from slashcompute.jobs import LoraFinetuneSpec, parse_spec
 log = logging.getLogger(__name__)
 
 MAX_DATASET_BYTES = 32 * 1024 * 1024
+
+
+def _sane_usage(u: UsageSample) -> bool:
+    return all(math.isfinite(v) and v >= 0 for v in u.model_dump().values())
 
 
 def safe_dataset_source(raw: str, *, max_bytes: int = MAX_DATASET_BYTES) -> Path:
@@ -260,6 +265,13 @@ class Coordinator:
         await self.recovery.on_node_lost(node_id, "disconnected")
 
     async def handle(self, node_id: str, msg: BaseModel) -> None:
+        # One message that trips a bug must not drop the node's whole connection.
+        try:
+            await self._dispatch(node_id, msg)
+        except Exception:
+            log.exception("failed handling %s from %s", type(msg).__name__, node_id[:8])
+
+    async def _dispatch(self, node_id: str, msg: BaseModel) -> None:
         if isinstance(msg, Heartbeat):
             self.registry.heartbeat(node_id, msg.status)
         elif isinstance(msg, DrainNotice):
@@ -292,6 +304,11 @@ class Coordinator:
     async def _on_step(self, node_id: str, msg: StepMetrics) -> None:
         job = self.jobs.get(msg.job_id)
         if job is None or job.current is None or job.current.epoch != msg.epoch:
+            return
+        if not _sane_usage(msg.usage):
+            # NaN can't be stored, and inf would bill the job's whole reserve to this node.
+            log.warning("ignoring step %d of job %s from %s: bad usage %s",
+                        msg.step, msg.job_id, node_id[:8], msg.usage)
             return
         self.ledger.record_step(node_id, msg)
         flops = float(msg.usage.flops)

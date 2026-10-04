@@ -22,15 +22,25 @@ def sandbox_enabled(flag: bool | None, cfg_default: bool) -> bool:
     return bool(cfg_default) and sys.platform == "darwin"
 
 
-def wrap_command(cmd: list[str], job_dir: Path, agent_dir: Path) -> list[str]:
-    """Prefix ``cmd`` with sandbox-exec. Fails closed: never runs the worker unsandboxed."""
+def unavailable_reason() -> str:
+    """Why the sandbox cannot run here, else ""."""
     exe = shutil.which("sandbox-exec")
     profile = profile_path()
     if exe is None or not profile.is_file():
-        raise RuntimeError(
+        return (
             f"sandbox requested but unavailable (sandbox-exec={exe}, profile={profile}); "
             "refusing to run the worker unsandboxed (pass --no-sandbox to opt out)"
         )
+    return ""
+
+
+def wrap_command(cmd: list[str], job_dir: Path, agent_dir: Path) -> list[str]:
+    """Prefix ``cmd`` with sandbox-exec. Fails closed: never runs the worker unsandboxed."""
+    why = unavailable_reason()
+    if why:
+        raise RuntimeError(why)
+    exe = shutil.which("sandbox-exec")
+    profile = profile_path()
     tmp = Path(os.environ.get("TMPDIR") or "/tmp")
     return [
         exe, "-f", str(profile),
