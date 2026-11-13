@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 import mlx.core as mx
 import pytest
 from mlx_lm.utils import load_model
@@ -5,7 +7,7 @@ from mlx_lm.utils import load_model
 from slashcompute.jobs import LoraFinetuneSpec
 from slashcompute.pipeline.data import load_examples, make_batch
 from slashcompute.pipeline.local import build_compute, run_local_pipeline
-from slashcompute.pipeline.model_profile import profile_model
+from slashcompute.pipeline.model_profile import _local_headers, profile_model
 from slashcompute.pipeline.shard import load_shard
 from slashcompute.pipeline.stage import merge_checkpoints
 
@@ -20,7 +22,26 @@ def test_profile(tiny_model):
     p = profile_model(str(tiny_model))
     assert p.num_layers == 6 and p.tie_word_embeddings
     assert all(b > 0 for b in p.layer_bytes)
-    assert p.total_weight_bytes == sum(p.layer_bytes) + p.embed_bytes + p.head_bytes
+    # tied: head_bytes already includes the embedding, which one stage loads once
+    assert 0 < p.embed_bytes < p.head_bytes
+    assert p.total_weight_bytes == sum(p.layer_bytes) + p.head_bytes
+    on_disk = sum(t["data_offsets"][1] - t["data_offsets"][0]
+                  for t in _local_headers(tiny_model).values())
+    assert p.total_weight_bytes == on_disk
+
+
+def test_profile_counts_tied_embedding_once_per_stage(tiny_model):
+    p = profile_model(str(tiny_model))
+    layers = sum(p.layer_bytes)
+    assert p.stage_weight_bytes(0, 6) == layers + p.head_bytes
+    # split stages each load their own copy, so both ends still count it
+    assert p.stage_weight_bytes(0, 3) == sum(p.layer_bytes[:3]) + p.embed_bytes
+    assert p.stage_weight_bytes(3, 6) == sum(p.layer_bytes[3:]) + p.head_bytes
+    assert p.stage_weight_bytes(0, 3) + p.stage_weight_bytes(3, 6) == (
+        p.stage_weight_bytes(0, 6) + p.embed_bytes)
+    # untied: the head is its own tensor, so a single stage owns both in full
+    untied = replace(p, tie_word_embeddings=False)
+    assert untied.stage_weight_bytes(0, 6) == layers + p.embed_bytes + p.head_bytes
 
 
 def test_shards_compose_to_full_model(tiny_model):
