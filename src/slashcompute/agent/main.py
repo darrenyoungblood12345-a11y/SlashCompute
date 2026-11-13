@@ -24,7 +24,8 @@ def _home(home: Optional[Path]) -> Path:
 def start(
     url: Optional[str] = typer.Option(None, help="Coordinator URL (default: LAN mDNS)"),
     gpu_percent: int = typer.Option(50, min=1, max=100, help="Fraction of time spent computing"),
-    data_port: int = typer.Option(9700, help="TCP port peers dial for activations/gradients"),
+    data_port: Optional[int] = typer.Option(
+        None, help="TCP port peers dial for activations/gradients (default 9700)"),
     max_memory_gb: Optional[float] = typer.Option(None, help="Cap contributed unified memory"),
     localhost: bool = typer.Option(False, help="Advertise 127.0.0.1 (same-machine cluster)"),
     sandbox: Optional[bool] = typer.Option(None, help="Run the worker under sandbox-exec"),
@@ -37,7 +38,8 @@ def start(
     setup_logging("agent")
     use_sandbox = False if no_sandbox else sandbox
     opt = AgentOptions(
-        url=url, home=home, gpu_percent=gpu_percent, data_port=data_port,
+        url=url, home=home, gpu_percent=gpu_percent,
+        data_port=data_port or EngineConfig.from_env().data_port,
         max_memory_gb=max_memory_gb, localhost=localhost, sandbox=use_sandbox, name=name,
         session_token=session_token,
     )
