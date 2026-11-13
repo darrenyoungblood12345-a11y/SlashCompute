@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import shutil
 from pathlib import Path
 from typing import Optional
 
@@ -60,13 +61,23 @@ class CheckpointStore:
             if m:
                 out[f"model.layers.{m.group(1)}.{m.group(2)}"] = v
         d = self.job_dir(job_id) / "adapter"
-        d.mkdir(exist_ok=True)
-        mx.save_safetensors(str(d / "adapters.safetensors"), out)
-        (d / "adapter_config.json").write_text(json.dumps({
-            "fine_tune_type": "lora",
-            "model": spec.model,
-            "num_layers": num_layers,
-            "lora_parameters": {"rank": spec.lora_rank, "scale": spec.lora_scale,
-                                "dropout": 0.0, "keys": spec.lora_targets},
-        }, indent=2))
+        # Build next to the final directory and rename it into place, so a
+        # failed export never leaves a half-written adapter to be served.
+        tmp = d.with_name("adapter.partial")
+        shutil.rmtree(tmp, ignore_errors=True)
+        tmp.mkdir()
+        try:
+            mx.save_safetensors(str(tmp / "adapters.safetensors"), out)
+            (tmp / "adapter_config.json").write_text(json.dumps({
+                "fine_tune_type": "lora",
+                "model": spec.model,
+                "num_layers": num_layers,
+                "lora_parameters": {"rank": spec.lora_rank, "scale": spec.lora_scale,
+                                    "dropout": 0.0, "keys": spec.lora_targets},
+            }, indent=2))
+            shutil.rmtree(d, ignore_errors=True)
+            tmp.rename(d)
+        except BaseException:
+            shutil.rmtree(tmp, ignore_errors=True)
+            raise
         return d

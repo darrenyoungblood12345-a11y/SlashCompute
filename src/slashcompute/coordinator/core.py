@@ -151,7 +151,10 @@ class Coordinator:
             self.checkpoints.export_adapter(job.id, job.spec.steps, job.spec, job.profile.num_layers)
         except Exception as e:
             log.exception("adapter export failed")
-            row.error = f"adapter export failed: {e}"
+            # No adapter means nothing to hand back: that is a failed job, not
+            # a completed one with an error note.
+            await self.fail_job(job, f"adapter export failed: {e}")
+            return
         row.status, row.finished_at = "completed", now()
         self.db.save(row)
         self.credits.settle_job(job.id)

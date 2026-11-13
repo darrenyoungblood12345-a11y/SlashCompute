@@ -81,6 +81,23 @@ def _upload_ckpt(client, spec, a: P.StageAssignment, step, tmp_path):
     assert r.status_code == 200, r.text
 
 
+def _running_job(client, spec, a, b):
+    """Submit `spec` to two idle agents and bring the job to 'running'.
+    Returns (job_id, {stage_idx: (assignment, agent)})."""
+    r = client.post("/jobs", json=json.loads(spec.model_dump_json()))
+    assert r.status_code == 200, r.text
+    job_id = r.json()["id"]
+    by_stage = {}
+    for x in (a, b):
+        m = x.recv()
+        assert isinstance(m, P.StageAssignment)
+        by_stage[m.stage_idx] = (m, x)
+    for idx, (m, ag) in by_stage.items():
+        ag.send(P.StageReady(job_id=job_id, epoch=m.epoch, stage_idx=idx))
+    _wait(lambda: client.get(f"/jobs/{job_id}").json()["status"] == "running")
+    return job_id, by_stage
+
+
 def test_full_job_lifecycle(env):
     client, core, tiny_model, tiny_dataset, tmp_path = env
     a, b = FakeAgent(client, "node-a"), FakeAgent(client, "node-b", port=9001)
@@ -128,6 +145,60 @@ def test_full_job_lifecycle(env):
     assert ledger[("node-a", "train")]["flops"] == 2e9 and ledger[("node-a", "train")]["disputed_flops"] == 0
     assert not [v for v in client.get("/verifications").json() if v["kind"] == "chain"]
     a.close(); b.close()
+
+
+def test_failed_adapter_export_fails_the_job(env):
+    """Both stages report done but the final checkpoint never arrived, so there
+    is nothing to export: the job must not be advertised as completed."""
+    client, core, tiny_model, tiny_dataset, tmp_path = env
+    a, b = FakeAgent(client, "node-a"), FakeAgent(client, "node-b", port=9001)
+    try:
+        a.pass_canary(); b.pass_canary()
+        _wait(lambda: all(n.canary_passed for n in core.registry.nodes.values()))
+        job_id, by_stage = _running_job(client, _spec(tiny_model, tiny_dataset), a, b)
+        for idx, (m, ag) in by_stage.items():
+            ag.send(P.StageFinished(job_id=job_id, epoch=1, stage_idx=idx, reason="done", last_step=2))
+        _wait(lambda: client.get(f"/jobs/{job_id}").json()["finished_at"] is not None)
+        job = client.get(f"/jobs/{job_id}").json()
+        assert job["status"] == "failed", job
+        assert "adapter export failed" in job["error"]
+        assert job["adapter_dir"] is None
+        for name in ("adapters.safetensors", "adapter_config.json"):
+            assert client.get(f"/jobs/{job_id}/adapter/{name}").status_code == 404
+    finally:
+        a.close(); b.close()
+
+
+def test_adapter_export_leaves_nothing_behind_when_it_fails(tmp_path, tiny_model, tiny_dataset, monkeypatch):
+    from slashcompute.coordinator import checkpoints as C
+
+    spec = _spec(tiny_model, tiny_dataset, min_stages=1)
+    store = C.CheckpointStore(tmp_path / "jobs")
+    comp = build_compute(spec, 0, 6, 6)
+    comp.save_checkpoint(tmp_path / "stage0.safetensors", 2)
+    assert store.store_stage("j", 1, 2, 0, (tmp_path / "stage0.safetensors").read_bytes(), 1)
+    adapter = store.job_dir("j") / "adapter"
+
+    def boom(*a, **kw):
+        raise OSError("disk full")
+
+    # The weights are written first; failing on the config used to leave an
+    # adapter directory that the download endpoint served as if complete.
+    with monkeypatch.context() as m:
+        m.setattr(C.json, "dumps", boom)
+        with pytest.raises(OSError):
+            store.export_adapter("j", 2, spec, 6)
+    assert not adapter.exists()
+    assert [p.name for p in store.job_dir("j").iterdir() if "adapter" in p.name] == []
+
+    assert store.export_adapter("j", 2, spec, 6) == adapter
+    assert sorted(p.name for p in adapter.iterdir()) == ["adapter_config.json", "adapters.safetensors"]
+    # A re-export that fails keeps the previous complete adapter.
+    with monkeypatch.context() as m:
+        m.setattr(C.json, "dumps", boom)
+        with pytest.raises(OSError):
+            store.export_adapter("j", 2, spec, 6)
+    assert sorted(p.name for p in adapter.iterdir()) == ["adapter_config.json", "adapters.safetensors"]
 
 
 def test_chain_mismatch_disputes(env):
