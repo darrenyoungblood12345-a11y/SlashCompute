@@ -66,6 +66,15 @@ function btn(id, label, extra = "") {
   return `<button type="button" class="btn ${extra}" data-act="${id}">${label}</button>`;
 }
 
+// Text and number fields reach `state` only on `change`, so until then what is
+// being typed lives in the field alone and a redraw of the pane would lose it.
+function draftField() {
+  const el = document.activeElement;
+  if (!el || !/^(INPUT|TEXTAREA)$/.test(el.tagName)) return null;
+  if (/^(range|checkbox|file)$/.test(el.type)) return null;
+  return $("#code").contains(el) && el.value !== el.defaultValue ? el : null;
+}
+
 function render() {
   const active = document.activeElement;
   const keepId = active && active.id && /^(INPUT|TEXTAREA)$/.test(active.tagName) ? active.id : null;
@@ -80,9 +89,14 @@ function render() {
     b.setAttribute("aria-selected", on ? "true" : "false");
   });
   $("#index").textContent = String(state.status.nodes ?? 0);
-  if (file === "contribute") $("#code").innerHTML = lines(contributeLines());
-  else if (file === "take") $("#code").innerHTML = lines(takeLines());
-  else $("#code").innerHTML = lines(ledgerLines());
+  const pane = $("#code");
+  // The poll redraws every 2 s: leave the pane alone while a field in it holds
+  // uncommitted text; it catches up on the first redraw after the edit ends.
+  if (pane.dataset.file === file && draftField()) return;
+  pane.dataset.file = file;
+  if (file === "contribute") pane.innerHTML = lines(contributeLines());
+  else if (file === "take") pane.innerHTML = lines(takeLines());
+  else pane.innerHTML = lines(ledgerLines());
   bindPane();
 
   if (keepId) {
@@ -193,7 +207,12 @@ function bindPane() {
   for (const [id, fn] of Object.entries(map)) {
     const el = document.getElementById(id);
     if (!el) continue;
-    el.addEventListener(el.type === "range" || el.type === "checkbox" ? "input" : "change", () => fn(el));
+    const live = el.type === "range" || el.type === "checkbox";
+    el.addEventListener(live ? "input" : "change", () => {
+      fn(el);
+      // committed: no longer a draft, so redraws may resume while it keeps focus
+      if (!live) el.defaultValue = el.value;
+    });
   }
   const file = $("#dataset");
   if (file) file.addEventListener("change", () => {

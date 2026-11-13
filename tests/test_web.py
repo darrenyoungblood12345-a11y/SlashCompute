@@ -1,7 +1,14 @@
+import shutil
+import subprocess
+from pathlib import Path
+
+import pytest
 from fastapi.testclient import TestClient
 
 from slashcompute.launcher.controller import Launcher, LauncherSettings
-from slashcompute.web.server import create_shell
+from slashcompute.web.server import STATIC, create_shell
+
+NODE = shutil.which("node")
 
 
 class FakeProc:
@@ -123,3 +130,18 @@ def test_proxy_allows_health_and_blocks_other(tmp_path):
         assert c.get("/api/coord/auth/me").status_code == 200
         assert c.get("/api/coord/verify/secret").status_code == 404
         assert c.get("/api/shell").json()["generation"] >= 2
+
+
+@pytest.mark.skipif(NODE is None, reason="node is not installed")
+@pytest.mark.parametrize("scenario", [
+    "poll_keeps_text_being_typed",
+    "poll_keeps_text_being_typed_in_every_field",
+    "typed_text_survives_a_poll_and_is_used_by_start",
+    "pane_still_follows_the_poll_when_nothing_is_being_typed",
+])
+def test_app_js_poll_does_not_discard_edits(scenario):
+    # app.js against a stub DOM (no browser, no network): see app_js_harness.cjs
+    harness = Path(__file__).with_name("app_js_harness.cjs")
+    r = subprocess.run([NODE, str(harness), str(STATIC / "app.js"), scenario],
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stderr
