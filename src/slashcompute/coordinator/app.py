@@ -17,6 +17,7 @@ from slashcompute.community.credits import CreditError
 from slashcompute.community.http import _token, mount_community
 from slashcompute.common.config import EngineConfig
 from slashcompute.common.protocol import Register, dump, parse_agent_message
+from slashcompute.coordinator.checkpoints import InvalidCheckpoint
 from slashcompute.coordinator.core import Coordinator
 from slashcompute.coordinator.db import Verification
 from slashcompute.jobs import parse_spec
@@ -206,10 +207,20 @@ def create_app(cfg: EngineConfig, advertise: bool = False) -> FastAPI:
         return FileResponse(path)
 
     @app.post("/jobs/{job_id}/checkpoints/{step}")
-    async def put_checkpoint(job_id: str, step: int, epoch: int, stage: int, request: Request):
+    async def put_checkpoint(job_id: str, step: int, epoch: int, stage: int, request: Request,
+                             x_node_token: Optional[str] = Header(default=None)):
+        # Agents have no account; the token from their Welcome says which
+        # registered node is calling.
+        node = core.registry.by_token(x_node_token)
+        if node is None:
+            raise HTTPException(401, "a registered node's token is required (X-Node-Token)")
         data = await request.body()
         try:
-            core.on_checkpoint_upload(job_id, epoch, stage, step, data)
+            core.on_checkpoint_upload(node.node_id, job_id, epoch, stage, step, data)
+        except PermissionError as e:
+            raise HTTPException(403, str(e))
+        except InvalidCheckpoint as e:
+            raise HTTPException(400, str(e))
         except ValueError as e:
             raise HTTPException(409, str(e))
         return {"ok": True}

@@ -142,6 +142,7 @@ class Daemon:
                 welcome = parse_coordinator_message(await ws.recv())
                 if not isinstance(welcome, Welcome):
                     raise SystemExit(f"expected welcome, got {type(welcome).__name__}")
+                opt.http.node_token = welcome.node_token
                 interval = welcome.heartbeat_interval_s
                 hb = asyncio.create_task(self._heartbeats(interval))
                 try:
@@ -242,7 +243,9 @@ class Daemon:
             "data_port": self.opt.data_port,
             "gpu_percent": self.opt.gpu_percent,
             "node_id": self.opt.node_id,
+            "node_token": self.opt.http.node_token,
         }))
+        spec_path.chmod(0o600)  # holds the node token
         cmd = wrap_command(
             [sys.executable, "-m", "slashcompute.agent.worker", "--assignment", str(spec_path)],
             job_dir, self.opt.paths.root,

@@ -23,11 +23,11 @@ from slashcompute.common.protocol import (
 from slashcompute.community.auth import Auth
 from slashcompute.community.credits import Credits
 from slashcompute.community.grants import Grants
-from slashcompute.coordinator.checkpoints import CheckpointStore
+from slashcompute.coordinator.checkpoints import CheckpointStore, InvalidCheckpoint
 from slashcompute.coordinator.db import Checkpoint, Database, Job, Node, now
 from slashcompute.coordinator.ledger import Ledger
 from slashcompute.coordinator.recovery import Recovery
-from slashcompute.coordinator.registry import Registry, SendFn
+from slashcompute.coordinator.registry import Assignment, Registry, SendFn
 from slashcompute.coordinator.scheduler import ACTIVE, TERMINAL, WAITING, JobRuntime, Scheduler
 from slashcompute.coordinator.verification import VerificationManager
 from slashcompute.jobs import LoraFinetuneSpec, parse_spec
@@ -165,12 +165,23 @@ class Coordinator:
         self.credits.settle_job(job.id)
         log.info("job %s completed (%d steps, last loss %s)", job.id, row.progress_step, row.last_loss)
 
-    def on_checkpoint_upload(self, job_id: str, epoch: int, stage_idx: int, step: int,
-                             data: bytes) -> None:
+    def on_checkpoint_upload(self, node_id: str, job_id: str, epoch: int, stage_idx: int,
+                             step: int, data: bytes) -> None:
         job = self.jobs.get(job_id)
         if job is None or job.current is None or job.current.epoch != epoch:
             raise ValueError("unknown or stale job epoch")
-        merged = self.checkpoints.store_stage(job_id, epoch, step, stage_idx, data, job.num_stages)
+        # A checkpoint is what the job recovers from, so only the node working
+        # on this stage right now may write it. The live assignment (not just
+        # the plan) is checked: it ends when the stage finishes or the epoch is
+        # torn down, and a node id re-registered by someone else never has it.
+        node = self.registry.get(node_id)
+        if node is None or node.assignment != Assignment(job_id, epoch, stage_idx):
+            raise PermissionError("this node is not assigned to that stage")
+        if not 0 < step <= job.spec.steps:
+            raise InvalidCheckpoint(f"step {step} is outside this job")
+        plan = job.current.plans[stage_idx]
+        merged = self.checkpoints.store_stage(job_id, epoch, step, stage_idx, data, job.num_stages,
+                                              layers=(plan.layer_start, plan.layer_end))
         if merged is not None and step > job.row.last_checkpoint_step:
             job.row.last_checkpoint_step = step
             self.db.save(job.row)
@@ -207,7 +218,8 @@ class Coordinator:
         log.info("node %s registered: %s (%s, lends %.1f GB, %.1f TFLOPS, gpu %d%%)",
                  msg.node_id[:8], msg.name, d.chip, d.memory_contrib_bytes / 1e9, d.matmul_tflops,
                  msg.gpu_percent)
-        await send(Welcome(node_id=msg.node_id, heartbeat_interval_s=self.cfg.heartbeat_interval_s))
+        await send(Welcome(node_id=msg.node_id, heartbeat_interval_s=self.cfg.heartbeat_interval_s,
+                           node_token=state.token))
 
     async def on_disconnect(self, node_id: str) -> None:
         await self.recovery.on_node_lost(node_id, "disconnected")

@@ -2,6 +2,7 @@
 
 import json
 import time
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -14,6 +15,7 @@ from slashcompute.jobs import LoraFinetuneSpec
 from slashcompute.pipeline.local import build_compute
 
 GB = 1024**3
+REMOTE = ("192.168.1.50", 50000)
 
 
 class FakeAgent:
@@ -25,7 +27,10 @@ class FakeAgent:
             device=P.DeviceProfile(chip="test", memory_total_bytes=mem, memory_available_bytes=mem,
                                    working_set_bytes=mem, memory_contrib_bytes=mem,
                                    matmul_tflops=1.0, mem_bandwidth_gbps=100.0))))
-        assert isinstance(self.recv(), P.Welcome)
+        welcome = self.recv()
+        assert isinstance(welcome, P.Welcome)
+        # Issued per registration; proves on HTTP that a request is this node's.
+        self.token = welcome.node_token
 
     def recv(self):
         return P.parse_coordinator_message(self.ws.receive_text())
@@ -72,12 +77,22 @@ def _spec(tiny_model, tiny_dataset, **kw):
     return LoraFinetuneSpec(**(base | kw))
 
 
-def _upload_ckpt(client, spec, a: P.StageAssignment, step, tmp_path):
+def _ckpt_bytes(spec, a: P.StageAssignment, step, tmp_path) -> bytes:
     comp = build_compute(spec, a.layer_start, a.layer_end, a.num_layers)
     path = tmp_path / f"s{a.stage_idx}_e{a.epoch}_{step}.safetensors"
     comp.save_checkpoint(path, step)
-    r = client.post(f"/jobs/{a.job_id}/checkpoints/{step}?epoch={a.epoch}&stage={a.stage_idx}",
-                    content=path.read_bytes())
+    return path.read_bytes()
+
+
+def _post_ckpt(client, a: P.StageAssignment, step, data, token, **override):
+    """Upload as an agent does. `override` lets a test lie about job/epoch/stage."""
+    q = {"job_id": a.job_id, "epoch": a.epoch, "stage": a.stage_idx} | override
+    return client.post(f"/jobs/{q['job_id']}/checkpoints/{step}?epoch={q['epoch']}&stage={q['stage']}",
+                       content=data, headers={"X-Node-Token": token} if token else {})
+
+
+def _upload_ckpt(client, spec, a: P.StageAssignment, step, tmp_path, agent):
+    r = _post_ckpt(client, a, step, _ckpt_bytes(spec, a, step, tmp_path), agent.token)
     assert r.status_code == 200, r.text
 
 
@@ -131,7 +146,7 @@ def test_full_job_lifecycle(env):
                                   in_digest=f"in{idx}-{step}", out_digest=f"in{idx + 1}-{step}",
                                   usage=_usage()))
     for idx, (m, ag) in by_stage.items():
-        _upload_ckpt(client, spec, m, 2, tmp_path)
+        _upload_ckpt(client, spec, m, 2, tmp_path, ag)
         ag.send(P.StageFinished(job_id=job_id, epoch=1, stage_idx=idx, reason="done", last_step=2))
     _wait(lambda: client.get(f"/jobs/{job_id}").json()["status"] == "completed")
 
@@ -284,6 +299,148 @@ def test_unassigned_node_cannot_finish_another_jobs_stage(victim_job, reason):
     _wait(lambda: client.get(f"/jobs/{job_id}").json()["recoveries"] == 1)
 
 
+def _stored(core, job_id):
+    """Every checkpoint file of a job, with its content."""
+    root = core.checkpoints.job_dir(job_id) / "ckpt"
+    return {str(p.relative_to(root)): p.read_bytes() for p in sorted(root.rglob("*.safetensors"))}
+
+
+def test_checkpoint_upload_requires_the_assigned_node(victim_job, tmp_path):
+    """Checkpoint uploads were open to anyone who knew a job id: a stranger
+    could replace the data a job recovers from."""
+    client, core, job_id, by_stage, intruder = victim_job
+    spec = core.jobs[job_id].spec
+    (m0, n0), (m1, n1) = by_stage[0], by_stage[1]
+    for m, n in by_stage.values():
+        _upload_ckpt(client, spec, m, 5, tmp_path, n)
+    _wait(lambda: client.get(f"/jobs/{job_id}").json()["last_checkpoint_step"] == 5)
+    good = _stored(core, job_id)
+    assert set(good) == {"epoch1/step000005/stage0.safetensors", "epoch1/step000005/stage1.safetensors",
+                         "step_000005.safetensors"}
+
+    remote = _remote(client)
+    evil = _ckpt_bytes(spec.model_copy(update={"seed": 99, "lora_scale": 1e6}), m0, 5, tmp_path)
+    attempts = [
+        (remote, None, {}, 401),                      # no credential
+        (remote, "not-a-token", {}, 401),             # made-up credential
+        (remote, "", {}, 401),
+        (remote, n0.node_id, {}, 401),                # node ids are public, not credentials
+        (remote, intruder.token, {}, 403),            # a real node, but not on this job
+        (remote, n1.token, {}, 403),                  # the other stage's node
+        (client, intruder.token, {}, 403),            # being on the coordinator machine is not enough
+        (remote, n0.token, {"stage": 1}, 403),        # right node, somebody else's stage
+        (remote, n0.token, {"stage": 7}, 403),        # a stage that does not exist
+    ]
+    for who, token, lie, want in attempts:
+        for step in (5, 6):  # overwrite an existing checkpoint, or plant the next one
+            r = _post_ckpt(who, m0, step, evil, token, **lie)
+            assert r.status_code == want, (token, lie, step, r.text)
+    # Stale epochs are refused as before.
+    assert _post_ckpt(remote, m0, 5, evil, n0.token, epoch=0).status_code in (403, 409)
+    assert _post_ckpt(remote, m0, 5, evil, n0.token, job_id="nope").status_code in (403, 409)
+    assert _stored(core, job_id) == good
+    assert client.get(f"/jobs/{job_id}").json()["last_checkpoint_step"] == 5
+
+    # The assigned node can still write (and rewrite) its own stage.
+    assert _post_ckpt(remote, m0, 5, good["epoch1/step000005/stage0.safetensors"], n0.token).status_code == 200
+
+
+def test_assigned_node_cannot_publish_an_invalid_checkpoint(victim_job, tmp_path, monkeypatch):
+    """Even the right node must send a checkpoint of its own stage and step,
+    and a rejected or interrupted upload must not disturb what is stored."""
+    client, core, job_id, by_stage, _ = victim_job
+    spec = core.jobs[job_id].spec
+    (m0, n0), (m1, n1) = by_stage[0], by_stage[1]
+    for m, n in by_stage.values():
+        _upload_ckpt(client, spec, m, 5, tmp_path, n)
+    good = _stored(core, job_id)
+    assert "step_000005.safetensors" in good
+
+    other_step = _ckpt_bytes(spec, m0, 4, tmp_path)
+    other_stage = _ckpt_bytes(spec, m1, 5, tmp_path)   # stage 1's layers, sent as stage 0
+    for data in (b"", b"not a safetensors file", other_step, other_stage):
+        r = _post_ckpt(client, m0, 5, data, n0.token)
+        assert r.status_code == 400, r.text
+    for step in (0, -3, spec.steps + 1):
+        r = _post_ckpt(client, m0, step, _ckpt_bytes(spec, m0, step, tmp_path), n0.token)
+        assert r.status_code in (400, 422), (step, r.text)
+    assert _stored(core, job_id) == good
+
+    # A merge that dies halfway keeps the previous merged checkpoint whole.
+    from slashcompute.coordinator import checkpoints as C
+
+    def boom(parts, out):
+        Path(out).write_bytes(b"half a file")
+        raise OSError("disk full")
+
+    monkeypatch.setattr(C, "merge_checkpoints", boom)
+    with pytest.raises(OSError):
+        _post_ckpt(client, m0, 5, good["epoch1/step000005/stage0.safetensors"], n0.token)
+    assert _stored(core, job_id) == good
+    assert client.get(f"/jobs/{job_id}").json()["last_checkpoint_step"] == 5
+
+
+def test_checkpoint_upload_cannot_reach_another_job(env, tmp_path):
+    """A node assigned to one job must not write into a different job."""
+    client, core, tiny_model, tiny_dataset, _ = env
+    agents = [FakeAgent(client, f"node-{x}", port=9000 + i) for i, x in enumerate("abcd")]
+    try:
+        for x in agents:
+            x.pass_canary()
+        _wait(lambda: all(n.canary_passed for n in core.registry.nodes.values()))
+        spec = _spec(tiny_model, tiny_dataset, max_stages=2, steps=10)
+        jobs = {}
+        for _ in range(2):
+            job_id = client.post("/jobs", json=json.loads(spec.model_dump_json())).json()["id"]
+            _wait(lambda: core.jobs[job_id].current is not None)
+            jobs[job_id] = {}
+        for x in agents:
+            m = x.recv()
+            assert isinstance(m, P.StageAssignment)
+            jobs[m.job_id][m.stage_idx] = (m, x)
+        (job_a, a), (job_b, b) = jobs.items()
+        assert len(a) == len(b) == 2
+        for idx in (0, 1):
+            m_b, node_b = b[idx]
+            data = _ckpt_bytes(spec, m_b, 5, tmp_path)
+            # job B's node, B's own epoch/stage numbers, but aimed at job A
+            assert _post_ckpt(client, m_b, 5, data, node_b.token, job_id=job_a).status_code == 403
+        assert _stored(core, job_a) == {}
+        for idx in (0, 1):
+            _upload_ckpt(client, spec, a[idx][0], 5, tmp_path, a[idx][1])
+        assert "step_000005.safetensors" in _stored(core, job_a)
+        assert _stored(core, job_b) == {}
+    finally:
+        for x in agents:
+            try:
+                x.close()
+            except Exception:
+                pass
+
+
+def test_node_token_is_per_registration_and_never_listed(victim_job, tmp_path):
+    client, core, job_id, by_stage, intruder = victim_job
+    spec = core.jobs[job_id].spec
+    m0, n0 = by_stage[0]
+    tokens = {n.token for _, n in by_stage.values()} | {intruder.token}
+    assert len(tokens) == 3 and all(t and len(t) >= 32 for t in tokens)
+    listing = client.get("/nodes").text + client.get(f"/jobs/{job_id}").text + client.get("/health").text
+    assert not any(t in listing for t in tokens)
+
+    # Re-registering under a victim's (public) node id does not inherit its stage:
+    # the old token dies with the old session and the new one holds no assignment.
+    old = n0.token
+    thief = FakeAgent(client, n0.node_id, port=9003)
+    try:
+        assert thief.token != old
+        data = _ckpt_bytes(spec, m0, 5, tmp_path)
+        assert _post_ckpt(client, m0, 5, data, old).status_code == 401
+        assert _post_ckpt(client, m0, 5, data, thief.token).status_code in (403, 409)
+        assert _stored(core, job_id) == {}
+    finally:
+        thief.close()
+
+
 def test_chain_mismatch_disputes(env):
     client, core, tiny_model, tiny_dataset, _ = env
     a, b = FakeAgent(client, "node-a"), FakeAgent(client, "node-b", port=9001)
@@ -358,13 +515,16 @@ def test_node_loss_triggers_recovery_and_reschedule(env):
         msgs = {x.node_id: x.recv() for x in assigned}
 
         for x in assigned:
-            _upload_ckpt(client, spec, msgs[x.node_id], 5, tmp_path)
+            _upload_ckpt(client, spec, msgs[x.node_id], 5, tmp_path, x)
         _wait(lambda: client.get(f"/jobs/{job_id}").json()["last_checkpoint_step"] == 5)
         lost, survivor = assigned
         lost.close()
 
         cancel = survivor.recv()
         assert isinstance(cancel, P.CancelStage) and cancel.epoch == 1
+        # The torn-down epoch no longer accepts checkpoints, even from its own node.
+        late = _ckpt_bytes(spec, msgs[survivor.node_id], 6, tmp_path)
+        assert _post_ckpt(client, msgs[survivor.node_id], 6, late, survivor.token).status_code in (403, 409)
         survivor.send(P.StageFinished(job_id=job_id, epoch=1, stage_idx=msgs[survivor.node_id].stage_idx,
                                       reason="cancelled", last_step=5))
         new = {x.node_id: x.recv() for x in (survivor, spare)}
@@ -403,7 +563,7 @@ def test_drain_sends_drain_to_stage0_and_resumes(env):
         assert isinstance(drain, P.Drain) and drain.epoch == 1
         for x in assigned:
             m = msgs[x.node_id]
-            _upload_ckpt(client, spec, m, 3, tmp_path)
+            _upload_ckpt(client, spec, m, 3, tmp_path, x)
             x.send(P.StageFinished(job_id=job_id, epoch=1, stage_idx=m.stage_idx, reason="drained", last_step=3))
         new = {x.node_id: x.recv() for x in (stage0, spare)}
         assert all(m.epoch == 2 and m.resume_step == 3 for m in new.values())
@@ -428,3 +588,9 @@ def test_job_upload_accepts_dataset_file(env):
     body = r.json()
     assert body["kind"] == "lora_finetune"
     assert body["id"] in core.jobs
+
+
+def _remote(client):
+    """The same coordinator as seen from another machine on the LAN."""
+    return TestClient(client.app, client=REMOTE)
+

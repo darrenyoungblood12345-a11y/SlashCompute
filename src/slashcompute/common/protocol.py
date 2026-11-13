@@ -137,6 +137,9 @@ class Welcome(BaseModel):
     type: Literal["welcome"] = "welcome"
     node_id: str
     heartbeat_interval_s: float
+    # Secret for this registration. The agent presents it on HTTP requests
+    # (X-Node-Token) so the coordinator knows which node is calling.
+    node_token: Optional[str] = None
 
 
 class StageAssignment(BaseModel):

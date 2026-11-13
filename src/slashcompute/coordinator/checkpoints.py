@@ -21,6 +21,15 @@ log = logging.getLogger(__name__)
 _ADAPTER_KEY = re.compile(r"^adapter/layers\.L(\d+)\.(.+)$")
 
 
+class InvalidCheckpoint(ValueError):
+    """An upload that is not the checkpoint it claims to be."""
+
+
+def _partial(path: Path) -> Path:
+    # mx.save_safetensors insists on the .safetensors suffix.
+    return path.with_name(f"{path.stem}.partial.safetensors")
+
+
 class CheckpointStore:
     def __init__(self, root: Path) -> None:
         self.root = root
@@ -39,15 +48,41 @@ class CheckpointStore:
         return self.job_dir(job_id) / "ckpt" / f"step_{step:06d}.safetensors"
 
     def store_stage(self, job_id: str, epoch: int, step: int, stage_idx: int, data: bytes,
-                    num_stages: int) -> Optional[Path]:
+                    num_stages: int, layers: Optional[tuple[int, int]] = None) -> Optional[Path]:
         """Save one stage's upload. Returns the merged path once the step is
-        complete for this epoch, else None."""
-        self.stage_path(job_id, epoch, step, stage_idx).write_bytes(data)
+        complete for this epoch, else None.
+
+        The upload must be a checkpoint of this step (and of `layers`, the
+        stage's layer range, when given). Files are written aside and renamed
+        into place, so a rejected or interrupted upload never replaces a good
+        stage file or the merged checkpoint a job recovers from."""
+        dest = self.stage_path(job_id, epoch, step, stage_idx)
+        tmp = _partial(dest)
+        tmp.write_bytes(data)
+        try:
+            try:
+                _, meta = mx.load(str(tmp), return_metadata=True)
+                found = (int(meta.get("step", -1)),
+                         (int(meta.get("layer_start", -1)), int(meta.get("layer_end", -1))))
+            except Exception as e:
+                raise InvalidCheckpoint(f"not a readable checkpoint: {e}") from e
+            if found[0] != step or (layers is not None and found[1] != tuple(layers)):
+                raise InvalidCheckpoint(
+                    f"checkpoint is for step {found[0]} layers {found[1]}, "
+                    f"expected step {step} layers {layers}")
+            tmp.replace(dest)
+        finally:
+            tmp.unlink(missing_ok=True)
         parts = [self.stage_path(job_id, epoch, step, i) for i in range(num_stages)]
         if not all(p.exists() and p.stat().st_size > 0 for p in parts):
             return None
         out = self.merged_path(job_id, step)
-        merge_checkpoints(parts, out)
+        tmp = _partial(out)
+        try:
+            merge_checkpoints(parts, tmp)
+            tmp.replace(out)
+        finally:
+            tmp.unlink(missing_ok=True)
         log.info("checkpoint complete job=%s step=%d", job_id, step)
         return out
 

@@ -184,7 +184,7 @@ def _stdio_app() -> None:
     assert isinstance(asg, StageAssignment)
 
     ctx = WorkerContext(
-        assignment=asg, http=CoordHTTP(blob["coordinator_url"]),
+        assignment=asg, http=CoordHTTP(blob["coordinator_url"], node_token=blob.get("node_token")),
         job_dir=Path(blob["job_dir"]), data_bind=blob["data_bind"],
         data_port=int(blob["data_port"]), gpu_percent=int(blob["gpu_percent"]),
         node_id=blob["node_id"],
