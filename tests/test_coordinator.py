@@ -7,7 +7,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from slashcompute.common import protocol as P
-from slashcompute.common.canary import run_canary_mlx
+from slashcompute.common.canary import compare_stats, expected_stats, run_canary_mlx
 from slashcompute.common.config import EngineConfig
 from slashcompute.coordinator.app import create_app
 from slashcompute.jobs import LoraFinetuneSpec
@@ -157,6 +157,36 @@ def test_failed_canary_excludes_node(env):
     _wait(lambda: core.registry.get("liar").canary_passed is False)
     assert core.registry.schedulable() == []
     a.close()
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_canary_rejects_non_finite_stats(bad):
+    exp = expected_stats(1, 64)
+    assert compare_stats(dict(exp), exp, 0.5) == (True, 0.0)
+    assert compare_stats({k: bad for k in exp}, exp, 0.5) == (False, float("inf"))
+    assert compare_stats({**exp, "trace": bad}, exp, 0.5) == (False, float("inf"))
+
+
+@pytest.mark.parametrize("bad", ["NaN", "Infinity", "-Infinity"])
+def test_non_finite_canary_result_fails_the_node(env, bad):
+    """End to end: P.dump() would turn NaN into null, so send the raw JSON a
+    hostile node would."""
+    client, core, *_ = env
+    a = FakeAgent(client, "nan-node")
+    try:
+        req = a.recv()
+        stats = ", ".join(f'"{k}": {bad}' for k in
+                          ("sum", "abs_sum", "fro", "trace", "c00", "c_last", "row0_dot"))
+        a.ws.send_text('{"type": "verify_result", "verify_id": "%s", "kind": "canary", '
+                       '"stats": {%s}}' % (req.verify_id, stats))
+        _wait(lambda: core.registry.get("nan-node").canary_passed is not None)
+        assert core.registry.get("nan-node").canary_passed is False
+        assert core.registry.schedulable() == []
+        # The failed row must still be listable: inf/NaN are not valid JSON.
+        v = next(v for v in client.get("/verifications").json() if v["id"] == req.verify_id)
+        assert v["status"] == "failed" and v["rel_error"] is None
+    finally:
+        a.close()
 
 
 def test_node_loss_triggers_recovery_and_reschedule(env):

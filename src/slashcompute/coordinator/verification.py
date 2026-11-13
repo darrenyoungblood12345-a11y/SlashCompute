@@ -19,6 +19,7 @@ Failures mark the affected usage records ``disputed``.
 from __future__ import annotations
 
 import logging
+import math
 import random
 import time
 import uuid
@@ -73,6 +74,9 @@ class VerificationManager:
 
     def _finish(self, v: Verification, status: str, detail: str | None = None,
                 rel_error: float | None = None) -> None:
+        # inf/NaN are not valid JSON and would break GET /verifications.
+        if rel_error is not None and not math.isfinite(rel_error):
+            rel_error = None
         v.status, v.detail, v.rel_error, v.finished_at = status, detail, rel_error, now()
         self.core.db.save(v)
         if status == "failed" and v.job_id is not None and v.step is not None:
@@ -213,7 +217,7 @@ class VerificationManager:
             else:
                 passed, worst = compare_stats(msg.stats, expected_stats(seed, size),
                                               core.cfg.canary_rel_tolerance)
-                detail = None
+                detail = None if math.isfinite(worst) else "missing or non-finite statistic"
             self._finish(v, "passed" if passed else "failed", detail, worst)
             if node is not None:
                 node.canary_passed = passed

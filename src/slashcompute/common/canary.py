@@ -4,6 +4,8 @@ A node that skips the work or returns made-up numbers fails."""
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 
 
@@ -49,7 +51,8 @@ def compare_stats(got: dict[str, float], expected: dict[str, float], rel_tol: fl
     scale = max(abs(expected["fro"]), 1e-12)
     worst = 0.0
     for k, v in expected.items():
-        if k not in got:
+        # max() silently drops NaN, so a non-finite value must fail outright.
+        if k not in got or not math.isfinite(got[k]):
             return False, float("inf")
         worst = max(worst, abs(got[k] - v) / scale)
     return worst <= rel_tol, worst
