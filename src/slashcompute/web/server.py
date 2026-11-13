@@ -66,6 +66,9 @@ def create_shell(launcher: Optional[Launcher] = None) -> FastAPI:
         snap = launch.snapshot()
         return {**asdict(snap), **asdict(launch.load_settings()),
                 "coordinator_url": launch.coordinator_url(launch.load_settings()),
+                # the UI's firewall and address hints name these
+                "coordinator_port": launch.cfg.coordinator_port,
+                "data_port": launch.cfg.data_port,
                 "finishes": list(FINISHES)}
 
     @app.post("/api/start")

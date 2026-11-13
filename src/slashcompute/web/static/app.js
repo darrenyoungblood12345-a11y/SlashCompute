@@ -124,7 +124,7 @@ function poolLines() {
     rows.push(`<label class="chk"><input type="checkbox" id="contribute" ${s.contribute ? "checked" : ""}> also contribute this Mac</label>`);
   } else {
     rows.push(`${kw("coordinator")} =`);
-    rows.push(`<input type="text" id="url" value="${esc(s.url)}" placeholder="192.168.1.10:8765" spellcheck="false">`);
+    rows.push(`<input type="text" id="url" value="${esc(s.url)}" placeholder="192.168.1.10:${st.coordinator_port ?? 8765}" spellcheck="false">`);
     rows.push(`<span class="row">${btn("discover", "FIND_ON_LAN")}</span>`);
   }
   rows.push(`${kw("coordinator")} ${st.coordinator_up ? str("UP") : kw("OFFLINE")}  ${cm(`nodes=${st.nodes ?? 0}`)}`);
@@ -144,7 +144,7 @@ function contributeLines() {
   if (state.error) rows.push(`<span class="err">${esc(state.error)}</span>`);
   else if (st.last_error && !st.coordinator_up) rows.push(`<span class="err">${esc(st.last_error)}</span>`);
   rows.push(`<span class="row">${btn("start", "START")}${btn("stop", "STOP", "ghost")}</span>`);
-  rows.push(`${cm("# allow TCP 8765 on the host, 9700 on each agent")}`);
+  rows.push(`${cm(`# allow TCP ${st.coordinator_port ?? 8765} on the host, ${st.data_port ?? 9700} on each agent`)}`);
   return rows;
 }
 

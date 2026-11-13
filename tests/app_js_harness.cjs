@@ -169,6 +169,18 @@ const scenarios = {
     assert.equal(field("url").value, "192.168.1.50");
     assert.equal(document.activeElement, field("url"));
   },
+
+  async ports_in_the_hints_follow_the_shell() {
+    // an older shell sends no ports: the usual ones are shown
+    assert.match(pane.innerHTML, /placeholder="192\.168\.1\.10:8765"/);
+    assert.match(pane.innerHTML, /allow TCP 8765 on the host, 9700 on each agent/);
+    // a build that runs beside another /compute uses its own ports and says so
+    server.status.coordinator_port = 8775;
+    server.status.data_port = 9710;
+    await poll();
+    assert.match(pane.innerHTML, /placeholder="192\.168\.1\.10:8775"/);
+    assert.match(pane.innerHTML, /allow TCP 8775 on the host, 9710 on each agent/);
+  },
 };
 
 (async () => {

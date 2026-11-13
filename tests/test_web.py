@@ -138,6 +138,7 @@ def test_proxy_allows_health_and_blocks_other(tmp_path):
     "poll_keeps_text_being_typed_in_every_field",
     "typed_text_survives_a_poll_and_is_used_by_start",
     "pane_still_follows_the_poll_when_nothing_is_being_typed",
+    "ports_in_the_hints_follow_the_shell",
 ])
 def test_app_js_poll_does_not_discard_edits(scenario):
     # app.js against a stub DOM (no browser, no network): see app_js_harness.cjs

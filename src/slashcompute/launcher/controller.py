@@ -214,7 +214,7 @@ class Launcher:
 
     def find_on_lan(self, timeout: float = 5.0) -> Optional[str]:
         found = self._discover(timeout)
-        return normalize_url(found) if found else None
+        return normalize_url(found, self.cfg.coordinator_port) if found else None
 
     def start(self, settings: LauncherSettings) -> StatusSnapshot:
         s = settings.clamp()
