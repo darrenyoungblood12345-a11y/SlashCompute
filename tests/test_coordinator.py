@@ -15,6 +15,7 @@ from slashcompute.jobs import LoraFinetuneSpec
 from slashcompute.pipeline.local import build_compute
 
 GB = 1024**3
+LOCAL = ("127.0.0.1", 50000)
 REMOTE = ("192.168.1.50", 50000)
 
 
@@ -67,7 +68,9 @@ def env(tmp_path, tiny_model, tiny_dataset):
     cfg = EngineConfig(home=tmp_path / "home", scheduler_tick_s=0.02, verify_rate=0.0,
                        canary_size=64, stage_overhead_bytes=0, heartbeat_timeout_s=60)
     app = create_app(cfg)
-    with TestClient(app) as client:
+    # These tests drive the coordinator as its operator, from the coordinator
+    # machine itself: only a loopback caller may submit a dataset by path.
+    with TestClient(app, client=LOCAL) as client:
         yield client, app.state.core, tiny_model, tiny_dataset, tmp_path
 
 
@@ -593,4 +596,123 @@ def test_job_upload_accepts_dataset_file(env):
 def _remote(client):
     """The same coordinator as seen from another machine on the LAN."""
     return TestClient(client.app, client=REMOTE)
+
+
+def _job_body(tiny_model, path):
+    return {"kind": "lora_finetune", "model": str(tiny_model), "dataset_path": str(path),
+            "steps": 2, "batch_size": 2, "microbatches": 1}
+
+
+def _datasets(core):
+    return sorted(core.cfg.coordinator_dir.rglob("dataset.jsonl"))
+
+
+@pytest.mark.parametrize("target", [
+    "secret", "coordinator-db", "traversal", "symlink-in-uploads", "other-job", "tmp-dataset",
+])
+def test_remote_submit_cannot_copy_a_coordinator_file(env, target):
+    """POST /jobs used to copy any readable file on the coordinator into a job,
+    where GET /jobs/{id}/dataset handed it to anyone."""
+    client, core, tiny_model, tiny_dataset, tmp_path = env
+    uploads = core.uploads_dir
+    uploads.mkdir(parents=True, exist_ok=True)
+    secret = tmp_path / "id_ed25519"
+    secret.write_text("PRIVATE KEY")
+    victim = client.post("/jobs", json=_job_body(tiny_model, tiny_dataset)).json()["id"]
+    if target == "symlink-in-uploads":
+        (uploads / "innocent.jsonl").symlink_to(secret)
+    path = {
+        "secret": secret,
+        "coordinator-db": core.cfg.coordinator_dir / "coordinator.db",
+        "traversal": uploads / ".." / "coordinator" / "coordinator.db",
+        "symlink-in-uploads": uploads / "innocent.jsonl",
+        "other-job": core.dataset_path(victim),
+        "tmp-dataset": tiny_dataset,
+    }[target]
+    assert path.exists()
+    before = _datasets(core)
+
+    r = _remote(client).post("/jobs", json=_job_body(tiny_model, path))
+    assert r.status_code == 403, r.text
+    assert "PRIVATE KEY" not in r.text
+    assert list(core.jobs) == [victim]
+    assert _datasets(core) == before
+    assert len(client.get("/jobs").json()) == 1
+
+
+@pytest.mark.parametrize("header", ["X-Forwarded-For", "Forwarded", "X-Real-IP"])
+def test_proxied_submit_is_not_treated_as_local(env, header):
+    """A reverse proxy on the coordinator machine makes every caller look like
+    loopback; a request that was forwarded is never 'local'."""
+    client, core, tiny_model, tiny_dataset, _ = env
+    r = client.post("/jobs", json=_job_body(tiny_model, tiny_dataset),
+                    headers={header: "for=203.0.113.9" if header == "Forwarded" else "203.0.113.9"})
+    assert r.status_code == 403, r.text
+    assert core.jobs == {}
+
+
+def test_local_submit_by_path_and_remote_upload_both_work(env):
+    client, core, tiny_model, tiny_dataset, _ = env
+    r = client.post("/jobs", json=_job_body(tiny_model, tiny_dataset))
+    assert r.status_code == 200, r.text
+    assert client.get(f"/jobs/{r.json()['id']}/dataset").content == tiny_dataset.read_bytes()
+
+    remote = _remote(client)
+    r = remote.post(
+        "/jobs/upload",
+        files={"dataset": ("../../train.jsonl", b'{"tokens": [1, 2, 3]}\n', "application/jsonl")},
+        data={"model": str(tiny_model), "steps": 2, "min_stages": 1, "batch_size": 2,
+              "microbatches": 1},
+    )
+    assert r.status_code == 200, r.text
+    assert client.get(f"/jobs/{r.json()['id']}/dataset").content == b'{"tokens": [1, 2, 3]}\n'
+    # The upload landed inside the uploads directory despite its file name.
+    assert [p.parent for p in core.uploads_dir.iterdir()] == [core.uploads_dir]
+
+
+def test_submit_confines_dataset_to_uploads_unless_local(env):
+    """The rule lives in Coordinator.submit, so no caller can forget it."""
+    client, core, tiny_model, tiny_dataset, tmp_path = env
+    core.uploads_dir.mkdir(parents=True, exist_ok=True)
+    with pytest.raises(PermissionError):
+        core.submit(_spec(tiny_model, tiny_dataset))
+    with pytest.raises(PermissionError):
+        core.submit(_spec(tiny_model, core.uploads_dir / ".." / "coordinator" / "coordinator.db"))
+    assert core.jobs == {} and _datasets(core) == []
+    inside = core.uploads_dir / "mine.jsonl"
+    inside.write_bytes(tiny_dataset.read_bytes())
+    assert core.submit(_spec(tiny_model, inside)).id in core.jobs
+    assert core.submit(_spec(tiny_model, tiny_dataset), allow_local_path=True).id in core.jobs
+    with pytest.raises(FileNotFoundError):
+        core.submit(_spec(tiny_model, core.uploads_dir / "missing.jsonl"))
+
+
+def test_dataset_download_is_limited_to_the_jobs_stage0_node_and_the_operator(victim_job):
+    """A job's dataset used to be served to anyone who knew (or listed) its id."""
+    client, core, job_id, by_stage, intruder = victim_job
+    (m0, n0), (m1, n1) = by_stage[0], by_stage[1]
+    want = core.dataset_path(job_id).read_bytes()
+    remote = _remote(client)
+
+    def get(who, token=None):
+        return who.get(m0.dataset_url, headers={"X-Node-Token": token} if token else {})
+
+    assert get(remote).status_code == 401
+    assert get(remote, "not-a-token").status_code == 401
+    assert get(remote, n0.node_id).status_code == 401
+    assert get(remote, intruder.token).status_code == 403   # a node, but not on this job
+    assert get(remote, n1.token).status_code == 403         # only stage 0 reads the dataset
+    r = get(remote, n0.token)
+    assert r.status_code == 200 and r.content == want
+    assert get(client).content == want                      # the operator, on the machine itself
+    assert get(client, intruder.token).content == want
+    assert remote.get("/jobs/nope/dataset", headers={"X-Node-Token": n0.token}).status_code == 404
+
+    # Access ends with the assignment.
+    n0.send(P.StageFinished(job_id=job_id, epoch=1, stage_idx=0, reason="error", last_step=0))
+    _wait(lambda: core.registry.get(n0.node_id).assignment is None
+          or core.registry.get(n0.node_id).assignment.epoch != 1)
+    node = core.registry.get(n0.node_id)
+    if node.assignment is None or node.assignment.stage_idx != 0:
+        assert get(remote, n0.token).status_code == 403
 

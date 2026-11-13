@@ -112,6 +112,8 @@ def test_two_agents_complete_lora_job(cluster):
         "seed": 7,
         "checkpoint_every": 3,
     }
+    # Submitting by path is allowed because this caller is on the coordinator
+    # machine (loopback); a remote one has to upload the dataset.
     r = httpx.post(f"{url}/jobs", json=spec, timeout=30)
     assert r.status_code == 200, r.text
     job_id = r.json()["id"]

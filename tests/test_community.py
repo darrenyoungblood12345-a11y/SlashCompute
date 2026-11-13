@@ -40,7 +40,8 @@ def core(tmp_path, tiny_model, tiny_dataset):
 def env(tmp_path, tiny_model, tiny_dataset):
     cfg = EngineConfig(home=tmp_path / "home", scheduler_tick_s=0.05, verify_rate=0.0)
     app = create_app(cfg)
-    with TestClient(app) as client:
+    # A caller on the coordinator machine: only loopback may submit by path.
+    with TestClient(app, client=("127.0.0.1", 50000)) as client:
         yield client, app.state.core, tiny_model, tiny_dataset
 
 
@@ -464,12 +465,62 @@ def test_http_authenticated_take_reserves(env):
 
 
 def test_anonymous_submit_still_works(env):
+    """No account is needed on a LAN pool: by path from the coordinator machine,
+    by upload from anywhere else."""
     client, core, tiny_model, tiny_dataset = env
     spec = json.loads(_spec(tiny_model, tiny_dataset).model_dump_json())
     r = client.post("/jobs", json=spec)
     assert r.status_code == 200, r.text
     assert r.json()["reserved_flops"] is None
     assert r.json()["id"] in core.jobs
+
+    remote = TestClient(client.app, client=("192.168.1.50", 50000))
+    r = remote.post("/jobs", json=spec)
+    assert r.status_code == 403, r.text
+    assert len(core.jobs) == 1
+    r = remote.post(
+        "/jobs/upload",
+        files={"dataset": ("train.jsonl", tiny_dataset.read_bytes(), "application/jsonl")},
+        data={"model": str(tiny_model), "steps": 2, "min_stages": 1, "batch_size": 2,
+              "microbatches": 1},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["reserved_flops"] is None and r.json()["id"] in core.jobs
+
+
+def test_dataset_download_requires_the_owner_or_an_admin(env):
+    client, core, tiny_model, tiny_dataset = env
+    remote = TestClient(client.app, client=("192.168.1.50", 50000))
+    tokens = {}
+    for name in ("admin", "owner", "other"):   # the first account is the admin
+        tokens[name] = client.post("/auth/register", json={
+            "email": f"{name}@lan.test", "password": "password1", "name": name}).json()["token"]
+        user = core.auth.session_user(tokens[name])
+        core.auth.accept_terms(user)
+        core.credits.contribute(user.id, 1e12, 0)
+    upload = dict(
+        files={"dataset": ("train.jsonl", tiny_dataset.read_bytes(), "application/jsonl")},
+        data={"model": str(tiny_model), "steps": 2, "min_stages": 1, "batch_size": 2,
+              "microbatches": 1, "max_flops": 1e9},
+    )
+    owned = remote.post("/jobs/upload", headers=_hdr(tokens["owner"]), **upload).json()["id"]
+    upload["data"].pop("max_flops")
+    anonymous = remote.post("/jobs/upload", **upload).json()["id"]
+
+    def status(job_id, who=None, via=remote):
+        return via.get(f"/jobs/{job_id}/dataset", headers=_hdr(tokens[who]) if who else {}).status_code
+
+    assert status(owned) == 401
+    assert status(owned, "other") == 403
+    assert status(owned, "owner") == 200
+    assert status(owned, "admin") == 200
+    # Nobody owns an anonymous job: remotely only an admin (or its nodes) may read it.
+    assert status(anonymous) == 401
+    assert status(anonymous, "owner") == 403
+    assert status(anonymous, "admin") == 200
+    assert status(owned, via=client) == status(anonymous, via=client) == 200  # the operator
+    core.auth.set_banned(core.auth.session_user(tokens["owner"]), True)
+    assert status(owned, "owner") == 403
 
 
 def test_http_grant_moderation_and_leaderboard(env):
@@ -579,7 +630,7 @@ def _live_job(core, budget=None, *, split=0, nodes=("n1",)):
     if split:
         core.auth.update_profile(user, grant_split=split)
     core.credits.contribute(user.id, 1e12, 0)
-    job = core.submit(_spec(tiny_model, tiny_dataset, steps=20))
+    job = core.submit(_spec(tiny_model, tiny_dataset, steps=20), allow_local_path=True)
     if budget is not None:
         core.credits.reserve_job(user.id, job.id, budget)
 

@@ -106,8 +106,21 @@ class Coordinator:
 
     # ------------------------------------------------------------ jobs
 
-    def submit(self, spec: LoraFinetuneSpec) -> JobRuntime:
-        src = Path(spec.dataset_path).expanduser()
+    @property
+    def uploads_dir(self) -> Path:
+        return self.cfg.home / "uploads"
+
+    def submit(self, spec: LoraFinetuneSpec, *, allow_local_path: bool = False) -> JobRuntime:
+        """Queue a job. Its dataset is copied into the job store, where every
+        node assigned to the job can fetch it, so the source must be a file
+        uploaded for that purpose. `allow_local_path` is for a caller on the
+        coordinator machine itself, who may name any file there."""
+        # Resolved before the check so "..", "~" and symlinks cannot step out.
+        src = Path(spec.dataset_path).expanduser().resolve()
+        if not allow_local_path and not src.is_relative_to(self.uploads_dir.resolve()):
+            raise PermissionError(
+                "dataset_path is only accepted from the coordinator machine itself; "
+                "upload the dataset with POST /jobs/upload")
         if not src.is_file():
             raise FileNotFoundError(f"dataset not found on coordinator: {src}")
         job_id = uuid.uuid4().hex[:12]
