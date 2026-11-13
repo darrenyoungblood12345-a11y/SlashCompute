@@ -32,6 +32,11 @@ log = logging.getLogger(__name__)
 OnMessage = Callable[[object], Awaitable[None]]
 
 
+def bundle_path(job_dir: Path, step: int) -> Path:
+    """Where a stage saves what a replay of ``step`` needs (see ``StageSession.save_bundle``)."""
+    return job_dir / f"bundle_{step}.safetensors"
+
+
 class StageSession:
     """In-process stage so the daemon can drain / save verify bundles."""
 
@@ -230,15 +235,38 @@ async def run_stage(ctx: WorkerContext, emit: OnMessage) -> StageResult:
 # --------------------------------------------------------------------------- subprocess CLI
 
 
-async def _drain_on_stdin(session: StageSession, reader: asyncio.StreamReader) -> None:
-    """The daemon asks a sandboxed worker to drain with a ``{"type":"drain"}`` line on stdin."""
+def _export_bundle(ctx: WorkerContext, msg: dict) -> dict:
+    """Save what this stage holds for a sampled step, for the daemon to upload; the answer
+    echoes the request with ``ok``. Only this stage's own job and epoch and a plain step
+    number are served, and the file goes to this stage's job directory (the one place the
+    sandbox lets it write that the daemon reads), never to a path taken from the request."""
+    asg = ctx.assignment
+    job_id, epoch, step = msg.get("job_id"), msg.get("epoch"), msg.get("step")
+    ok = False
+    if job_id == asg.job_id and type(epoch) is int and epoch == asg.epoch and type(step) is int:
+        try:
+            ok = bool(ctx.session.save_bundle(step, bundle_path(ctx.job_dir, step)))
+        except Exception:  # answer anyway: the daemon is waiting, and the stage must go on
+            log.exception("could not save the bundle of step %d", step)
+    return {"type": "bundle", "job_id": job_id, "epoch": epoch, "step": step, "ok": ok}
+
+
+async def _serve_stdin(ctx: WorkerContext, reader: asyncio.StreamReader,
+                       answer: Callable[[dict], None]) -> None:
+    """What the daemon asks of a sandboxed worker, one JSON line each on stdin:
+    ``{"type":"drain"}``, and ``{"type":"bundle","job_id":…,"epoch":…,"step":…}`` for a
+    sampled step, which is answered on stdout (see ``_export_bundle``)."""
     while line := await reader.readline():
         try:
             msg = json.loads(line)
         except ValueError:
             continue
-        if isinstance(msg, dict) and msg.get("type") == "drain":
-            session.request_drain()
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("type") == "drain":
+            ctx.session.request_drain()
+        elif msg.get("type") == "bundle":
+            answer(_export_bundle(ctx, msg))
 
 
 def _stdin_is_pipe() -> bool:
@@ -279,20 +307,24 @@ def _stdio_app() -> None:
     # is the daemon's call (a drain line on stdin, or SIGTERM), so it must not die of it.
     signal.signal(signal.SIGINT, signal.SIG_IGN)
 
+    def answer(reply: dict) -> None:
+        print(json.dumps(reply), flush=True)
+
     async def main() -> None:
-        drains = None
+        requests = None
         if _stdin_is_pipe():
             reader = asyncio.StreamReader()
             await asyncio.get_running_loop().connect_read_pipe(
                 lambda: asyncio.StreamReaderProtocol(reader), sys.stdin)
-            drains = asyncio.create_task(_drain_on_stdin(ctx.session, reader))
+            requests = asyncio.create_task(_serve_stdin(ctx, reader, answer))
         else:
-            log.warning("stdin is not a pipe; this worker cannot be drained")
+            log.warning("stdin is not a pipe; this worker cannot be drained or asked for "
+                        "sampled steps")
         try:
             await run_stage(ctx, emit)
         finally:
-            if drains is not None:
-                drains.cancel()
+            if requests is not None:
+                requests.cancel()
 
     asyncio.run(main())
 
