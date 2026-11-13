@@ -110,22 +110,26 @@ class Credits:
     def job_account(self, job_id: str) -> Optional[JobAccount]:
         return self.db.get(JobAccount, job_id)
 
-    def consume_job(self, job_id: str, flops: float) -> bool:
-        """Charge a job's reserve. Returns True if the budget is exhausted."""
+    def consume_job(self, job_id: str, flops: float) -> float:
+        """Charge a job's reserve. Returns the FLOPs actually charged, which is
+        less than asked once the reserve runs out (and 0 without a reserve)."""
         if not math.isfinite(flops) or flops <= 0:
-            return False
+            return 0.0
         with self._spend_lock, self.db.session() as s:
             acct = s.get(JobAccount, job_id)
             if acct is None:
-                return False
-            remaining = acct.reserved_flops - acct.spent_flops
-            take = min(flops, remaining)
+                return 0.0
+            take = max(0.0, min(flops, acct.reserved_flops - acct.spent_flops))
             if take:
                 acct.spent_flops += take
                 s.add(acct)
                 s.add(CreditTxn(user_id=acct.user_id, kind="consumed", amount=take, job_id=job_id))
                 s.commit()
-            return acct.spent_flops >= acct.reserved_flops - 1e-9
+            return take
+
+    def job_exhausted(self, job_id: str) -> bool:
+        acct = self.job_account(job_id)
+        return acct is not None and acct.spent_flops >= acct.reserved_flops - 1e-9
 
     def settle_job(self, job_id: str) -> None:
         # Settling shrinks the reserve to what was spent, so a settled account

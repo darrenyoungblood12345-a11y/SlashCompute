@@ -38,6 +38,8 @@ class EpochState:
     started: float = field(default_factory=time.monotonic)
     ready: set[int] = field(default_factory=set)
     finished: dict[int, str] = field(default_factory=dict)
+    # stage_idx -> last step whose metrics were accepted (each step bills once)
+    metered: dict[int, int] = field(default_factory=dict)
     drain_requested: bool = False
     closed: bool = False
 

@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import shutil
 import uuid
 from pathlib import Path
@@ -17,7 +18,7 @@ from sqlmodel import select
 from slashcompute.common.config import EngineConfig
 from slashcompute.common.protocol import (
     CancelStage, DrainNotice, Heartbeat, Register, StageFinished, StageReady, StepMetrics,
-    VerifyBundleReady, VerifyResult, Welcome,
+    UsageSample, VerifyBundleReady, VerifyResult, Welcome,
 )
 from slashcompute.community.auth import Auth
 from slashcompute.community.credits import Credits
@@ -32,6 +33,10 @@ from slashcompute.coordinator.verification import VerificationManager
 from slashcompute.jobs import LoraFinetuneSpec, parse_spec
 
 log = logging.getLogger(__name__)
+
+
+def _sane_usage(u: UsageSample) -> bool:
+    return all(math.isfinite(v) and v >= 0 for v in u.model_dump().values())
 
 
 class Coordinator:
@@ -238,19 +243,34 @@ class Coordinator:
             p.stage_idx == stage_idx and p.node_id == node_id for p in cur.plans)
 
     async def _on_step(self, node_id: str, msg: StepMetrics) -> None:
+        """Meter one step of one stage. handle() has already checked that the
+        sender holds the stage."""
         job = self.jobs.get(msg.job_id)
-        if job is None or job.current is None or job.current.epoch != msg.epoch:
+        cur = job.current if job else None
+        # "starting" counts as live: a stage's first metrics can overtake another
+        # stage's StageReady, which travels on a different socket.
+        if cur is None or cur.epoch != msg.epoch or cur.closed or job.row.status not in ACTIVE:
             return
+        # Each step is billed once per stage. Replays, steps the job does not
+        # have and unusable numbers would otherwise mint credits (or, for NaN,
+        # corrupt the books).
+        if not (cur.metered.get(msg.stage_idx, 0) < msg.step <= job.spec.steps) \
+                or not _sane_usage(msg.usage):
+            log.warning("ignoring step %d of job %s from %s: duplicate, out of range or bad usage",
+                        msg.step, msg.job_id, node_id[:8])
+            return
+        cur.metered[msg.stage_idx] = msg.step
         self.ledger.record_step(node_id, msg)
-        flops = float(msg.usage.flops)
-        acct = self.credits.job_account(job.id)
+        # The node earns exactly what the job was charged; the charge is capped
+        # at the reserve, and a job without one mints nothing.
+        charged = self.credits.consume_job(job.id, float(msg.usage.flops))
         node = self.registry.get(node_id)
         owner_id = (node.user_id if node and node.user_id else self.credits.owner_of(node_id))
-        if owner_id and acct is not None:
+        if owner_id and charged:
             owner = self.auth.get(owner_id)
             split = owner.grant_split if owner else 0
-            self.credits.contribute(owner_id, flops, split, node_id=node_id, job_id=msg.job_id)
-        if self.credits.consume_job(job.id, flops):
+            self.credits.contribute(owner_id, charged, split, node_id=node_id, job_id=msg.job_id)
+        if self.credits.job_exhausted(job.id):
             await self.cancel_job(job)
             job.row.error = "FLOP budget spent"
             self.db.save(job.row)

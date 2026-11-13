@@ -17,6 +17,8 @@ from slashcompute.community.credits import POT_ID, CreditError
 from slashcompute.community.grants import GrantError
 from slashcompute.coordinator.app import create_app
 from slashcompute.coordinator.core import Coordinator
+from slashcompute.coordinator.partitioner import StagePlan
+from slashcompute.coordinator.registry import Assignment
 from slashcompute.coordinator.scheduler import EpochState
 from slashcompute.jobs import LoraFinetuneSpec
 
@@ -170,9 +172,16 @@ def test_reserve_consume_settle(core):
         core.credits.reserve_job(user.id, "job-x", 5000.0)
     core.credits.reserve_job(user.id, "job-1", 400.0)
     assert core.credits.balance(user.id) == 600.0
-    assert core.credits.consume_job("job-1", 150.0) is False
+    assert not core.credits.job_exhausted("job-1")
+    assert core.credits.consume_job("job-1", 150.0) == 150.0
     assert core.credits.lifetime_spent(user.id) == 150.0
-    assert core.credits.consume_job("job-1", 300.0) is True
+    assert not core.credits.job_exhausted("job-1")
+    # A charge is capped at what is left of the reserve.
+    assert core.credits.consume_job("job-1", 300.0) == 250.0
+    assert core.credits.job_exhausted("job-1")
+    assert core.credits.consume_job("job-1", 1.0) == 0.0
+    assert core.credits.consume_job("no-such-job", 1.0) == 0.0
+    assert not core.credits.job_exhausted("no-such-job")
     assert core.credits.lifetime_spent(user.id) == 400.0
     core.credits.settle_job("job-1")
     assert core.credits.balance(user.id) == 600.0
@@ -560,102 +569,152 @@ def test_banned_session_closes_agent(env):
     assert e.value.code == 4003
 
 
-def test_steps_earn_and_spend_one_to_one(core):
+def _live_job(core, budget=None, *, split=0, nodes=("n1",)):
+    """A running one-epoch job owned by a fresh account, with one registered
+    node (owned by the same account) planned for each stage. `budget=None`
+    leaves the job anonymous (no reserve)."""
     tiny_model, tiny_dataset = core._tiny
     user, token = _account(core.auth)
     core.auth.accept_terms(user)
+    if split:
+        core.auth.update_profile(user, grant_split=split)
     core.credits.contribute(user.id, 1e12, 0)
-    job = core.submit(_spec(tiny_model, tiny_dataset))
-    core.credits.reserve_job(user.id, job.id, 5e9)
-    job.current = EpochState(epoch=1, plans=[])
-    job.row.status = "running"
+    job = core.submit(_spec(tiny_model, tiny_dataset, steps=20))
+    if budget is not None:
+        core.credits.reserve_job(user.id, job.id, budget)
 
     async def send(_):
         return None
 
-    asyncio.run(core.on_register(P.Register(
-        node_id="n1", name="mac", device=_device(), data_host="127.0.0.1",
-        data_port=9700, gpu_percent=50, session_token=token,
-    ), send))
+    plans = []
+    for idx, node_id in enumerate(nodes):
+        asyncio.run(core.on_register(P.Register(
+            node_id=node_id, name="mac", device=_device(), data_host="127.0.0.1",
+            data_port=9700 + idx, gpu_percent=50, session_token=token,
+        ), send))
+        core.registry.get(node_id).assignment = Assignment(job.id, 1, idx)
+        plans.append(StagePlan(stage_idx=idx, node_id=node_id, layer_start=idx, layer_end=idx + 1,
+                               est_bytes=0))
+    job.current = EpochState(epoch=1, plans=plans)
+    job.row.status = "running"
+    return user, job
 
-    asyncio.run(core._on_step("n1", P.StepMetrics(
-        job_id=job.id, epoch=1, stage_idx=0, step=1, loss=1.0,
-        in_digest="in", out_digest="out", usage=_usage(1e9),
+
+def _step(core, job, step=1, flops=1e9, *, node="n1", stage=0, epoch=1, usage=None):
+    """Deliver step metrics the way the WebSocket handler does."""
+    asyncio.run(core.handle(node, P.StepMetrics(
+        job_id=job.id, epoch=epoch, stage_idx=stage, step=step, loss=1.0,
+        in_digest="in", out_digest="out", usage=usage or _usage(flops),
     )))
+
+
+def _books(core, user, job):
+    acct = core.credits.job_account(job.id)
+    return (core.credits.lifetime_earned(user.id) - 1e12, core.credits.lifetime_spent(user.id),
+            acct.spent_flops if acct else None, len(core.ledger.job_records(job.id)))
+
+
+def test_steps_earn_and_spend_one_to_one(core):
+    user, job = _live_job(core, 5e9)
+    _step(core, job, flops=1e9)
     assert core.credits.lifetime_earned(user.id) == pytest.approx(1e12 + 1e9)
     assert core.credits.lifetime_spent(user.id) == pytest.approx(1e9)
     assert core.credits.balance(user.id) == pytest.approx(1e12 - 5e9 + 1e9)
 
 
 def test_anonymous_job_does_not_mint_credits(core):
-    tiny_model, tiny_dataset = core._tiny
-    user, token = _account(core.auth)
-    core.auth.accept_terms(user)
-    job = core.submit(_spec(tiny_model, tiny_dataset))
-    job.current = EpochState(epoch=1, plans=[])
-
-    async def send(_):
-        return None
-
-    asyncio.run(core.on_register(P.Register(
-        node_id="n1", name="mac", device=_device(), data_host="127.0.0.1",
-        data_port=9700, gpu_percent=50, session_token=token,
-    ), send))
-    asyncio.run(core._on_step("n1", P.StepMetrics(
-        job_id=job.id, epoch=1, stage_idx=0, step=1, loss=1.0,
-        in_digest="in", out_digest="out", usage=_usage(1e9),
-    )))
-    assert core.credits.lifetime_earned(user.id) == 0.0
+    user, job = _live_job(core, None)
+    _step(core, job, flops=1e9)
+    assert core.credits.lifetime_earned(user.id) == 1e12
     assert core.credits.job_account(job.id) is None
+    assert len(core.ledger.job_records(job.id)) == 1  # usage is still recorded
 
 
 def test_budget_exhaust_cancels_job(core):
-    tiny_model, tiny_dataset = core._tiny
-    user, token = _account(core.auth)
-    core.auth.accept_terms(user)
-    core.credits.contribute(user.id, 1e12, 0)
-    job = core.submit(_spec(tiny_model, tiny_dataset))
-    core.credits.reserve_job(user.id, job.id, 1e9)
-    job.current = EpochState(epoch=1, plans=[])
-    job.row.status = "running"
-
-    async def send(_):
-        return None
-
-    asyncio.run(core.on_register(P.Register(
-        node_id="n1", name="mac", device=_device(), data_host="127.0.0.1",
-        data_port=9700, gpu_percent=50, session_token=token,
-    ), send))
-    asyncio.run(core._on_step("n1", P.StepMetrics(
-        job_id=job.id, epoch=1, stage_idx=0, step=1, loss=1.0,
-        in_digest="in", out_digest="out", usage=_usage(1e9),
-    )))
+    user, job = _live_job(core, 1e9)
+    _step(core, job, flops=1e9)
     assert job.row.status == "cancelled"
     assert job.row.error == "FLOP budget spent"
     assert core.credits.balance(user.id) == pytest.approx(1e12 - 1e9 + 1e9)
 
 
 def test_grant_split_on_step(core):
-    tiny_model, tiny_dataset = core._tiny
-    user, token = _account(core.auth)
-    core.auth.accept_terms(user)
-    core.auth.update_profile(user, grant_split=40)
-    core.credits.contribute(user.id, 1e12, 0)
-    job = core.submit(_spec(tiny_model, tiny_dataset))
-    core.credits.reserve_job(user.id, job.id, 1e10)
-    job.current = EpochState(epoch=1, plans=[])
-    job.row.status = "running"
-
-    async def send(_):
-        return None
-
-    asyncio.run(core.on_register(P.Register(
-        node_id="n1", name="mac", device=_device(), data_host="127.0.0.1",
-        data_port=9700, gpu_percent=50, session_token=token,
-    ), send))
-    asyncio.run(core._on_step("n1", P.StepMetrics(
-        job_id=job.id, epoch=1, stage_idx=0, step=1, loss=1.0,
-        in_digest="in", out_digest="out", usage=_usage(100.0),
-    )))
+    user, job = _live_job(core, 1e10, split=40)
+    _step(core, job, flops=100.0)
     assert core.credits.balance(POT_ID) == pytest.approx(40.0)
     assert core.credits.lifetime_earned(user.id) == pytest.approx(1e12 + 100.0)
+
+
+def test_step_credit_never_exceeds_what_the_job_was_charged(core):
+    """The charge is capped at the reserve, so the credit must be too."""
+    user, job = _live_job(core, 1e9, split=40)
+    _step(core, job, flops=5e9)
+    assert core.credits.lifetime_spent(user.id) == pytest.approx(1e9)
+    assert core.credits.lifetime_earned(user.id) == pytest.approx(1e12 + 1e9)
+    assert core.credits.balance(POT_ID) == pytest.approx(0.4e9)
+    assert job.row.status == "cancelled" and job.row.error == "FLOP budget spent"
+    # Nothing more is minted once the reserve is gone.
+    _step(core, job, step=2, flops=5e9)
+    assert core.credits.lifetime_earned(user.id) == pytest.approx(1e12 + 1e9)
+
+
+def test_duplicate_step_metrics_are_billed_once(core):
+    user, job = _live_job(core, 1e12, nodes=("n1", "n2"))
+    _step(core, job, step=1)
+    _step(core, job, step=1, node="n2", stage=1)  # each stage reports the step once
+    assert _books(core, user, job) == (2e9, 2e9, 2e9, 2)
+    for _ in range(5):
+        _step(core, job, step=1)
+    assert _books(core, user, job) == (2e9, 2e9, 2e9, 2)
+    _step(core, job, step=2)
+    _step(core, job, step=1)  # replaying an earlier step after moving on
+    _step(core, job, step=2)
+    assert _books(core, user, job) == (3e9, 3e9, 3e9, 3)
+
+
+@pytest.mark.parametrize("step", [0, -1, 21])
+def test_steps_outside_the_job_are_not_billed(core, step):
+    user, job = _live_job(core, 1e12)
+    _step(core, job, step=step)
+    assert _books(core, user, job) == (0, 0, 0, 0)
+
+
+@pytest.mark.parametrize("state", ["closed", "recovering", "cancelled", "completed", "failed", "stale-epoch"])
+def test_metrics_for_a_finished_epoch_are_not_billed(core, state):
+    user, job = _live_job(core, 1e12)
+    _step(core, job, step=1)
+    if state == "closed":
+        job.current.closed = True
+    elif state == "stale-epoch":
+        job.current = EpochState(epoch=2, plans=job.current.plans)
+    else:
+        job.current.closed = True
+        job.row.status = state
+    _step(core, job, step=2)
+    assert _books(core, user, job) == (1e9, 1e9, 1e9, 1)
+    if state not in ("closed", "stale-epoch"):
+        # Belt and braces: the job's status alone is enough to refuse.
+        job.current.closed = False
+        _step(core, job, step=3)
+        assert _books(core, user, job) == (1e9, 1e9, 1e9, 1)
+
+
+def test_metrics_from_another_stage_or_node_are_not_billed(core):
+    user, job = _live_job(core, 1e12, nodes=("n1", "n2"))
+    _step(core, job, node="n1", stage=1)   # n1 holds stage 0, not 1
+    _step(core, job, node="ghost", stage=0)
+    assert _books(core, user, job) == (0, 0, 0, 0)
+
+
+@pytest.mark.parametrize("field,bad", [
+    ("flops", float("nan")), ("flops", float("inf")), ("flops", -1e9),
+    ("wall_s", float("nan")), ("mem_byte_seconds", float("inf")), ("busy_s", -1.0),
+])
+def test_non_finite_or_negative_usage_is_not_billed(core, field, bad):
+    user, job = _live_job(core, 1e12)
+    _step(core, job, usage=_usage().model_copy(update={field: bad}))
+    assert _books(core, user, job) == (0, 0, 0, 0)
+    assert job.row.status == "running"
+    # A bad report does not burn the step: the honest one still counts.
+    _step(core, job)
+    assert _books(core, user, job) == (1e9, 1e9, 1e9, 1)
