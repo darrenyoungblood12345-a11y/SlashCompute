@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import shutil
 import uuid
 from pathlib import Path
@@ -17,21 +18,25 @@ from sqlmodel import select
 from slashcompute.common.config import EngineConfig
 from slashcompute.common.protocol import (
     CancelStage, DrainNotice, Heartbeat, Register, StageFinished, StageReady, StepMetrics,
-    VerifyBundleReady, VerifyResult, Welcome,
+    UsageSample, VerifyBundleReady, VerifyResult, Welcome,
 )
 from slashcompute.community.auth import Auth
 from slashcompute.community.credits import Credits
 from slashcompute.community.grants import Grants
-from slashcompute.coordinator.checkpoints import CheckpointStore
+from slashcompute.coordinator.checkpoints import CheckpointStore, InvalidCheckpoint
 from slashcompute.coordinator.db import Checkpoint, Database, Job, Node, now
 from slashcompute.coordinator.ledger import Ledger
 from slashcompute.coordinator.recovery import Recovery
-from slashcompute.coordinator.registry import Registry, SendFn
+from slashcompute.coordinator.registry import Assignment, Registry, SendFn
 from slashcompute.coordinator.scheduler import ACTIVE, TERMINAL, WAITING, JobRuntime, Scheduler
 from slashcompute.coordinator.verification import VerificationManager
 from slashcompute.jobs import LoraFinetuneSpec, parse_spec
 
 log = logging.getLogger(__name__)
+
+
+def _sane_usage(u: UsageSample) -> bool:
+    return all(math.isfinite(v) and v >= 0 for v in u.model_dump().values())
 
 
 class Coordinator:
@@ -101,8 +106,21 @@ class Coordinator:
 
     # ------------------------------------------------------------ jobs
 
-    def submit(self, spec: LoraFinetuneSpec) -> JobRuntime:
-        src = Path(spec.dataset_path).expanduser()
+    @property
+    def uploads_dir(self) -> Path:
+        return self.cfg.home / "uploads"
+
+    def submit(self, spec: LoraFinetuneSpec, *, allow_local_path: bool = False) -> JobRuntime:
+        """Queue a job. Its dataset is copied into the job store, where every
+        node assigned to the job can fetch it, so the source must be a file
+        uploaded for that purpose. `allow_local_path` is for a caller on the
+        coordinator machine itself, who may name any file there."""
+        # Resolved before the check so "..", "~" and symlinks cannot step out.
+        src = Path(spec.dataset_path).expanduser().resolve()
+        if not allow_local_path and not src.is_relative_to(self.uploads_dir.resolve()):
+            raise PermissionError(
+                "dataset_path is only accepted from the coordinator machine itself; "
+                "upload the dataset with POST /jobs/upload")
         if not src.is_file():
             raise FileNotFoundError(f"dataset not found on coordinator: {src}")
         job_id = uuid.uuid4().hex[:12]
@@ -151,18 +169,32 @@ class Coordinator:
             self.checkpoints.export_adapter(job.id, job.spec.steps, job.spec, job.profile.num_layers)
         except Exception as e:
             log.exception("adapter export failed")
-            row.error = f"adapter export failed: {e}"
+            # No adapter means nothing to hand back: that is a failed job, not
+            # a completed one with an error note.
+            await self.fail_job(job, f"adapter export failed: {e}")
+            return
         row.status, row.finished_at = "completed", now()
         self.db.save(row)
         self.credits.settle_job(job.id)
         log.info("job %s completed (%d steps, last loss %s)", job.id, row.progress_step, row.last_loss)
 
-    def on_checkpoint_upload(self, job_id: str, epoch: int, stage_idx: int, step: int,
-                             data: bytes) -> None:
+    def on_checkpoint_upload(self, node_id: str, job_id: str, epoch: int, stage_idx: int,
+                             step: int, data: bytes) -> None:
         job = self.jobs.get(job_id)
         if job is None or job.current is None or job.current.epoch != epoch:
             raise ValueError("unknown or stale job epoch")
-        merged = self.checkpoints.store_stage(job_id, epoch, step, stage_idx, data, job.num_stages)
+        # A checkpoint is what the job recovers from, so only the node working
+        # on this stage right now may write it. The live assignment (not just
+        # the plan) is checked: it ends when the stage finishes or the epoch is
+        # torn down, and a node id re-registered by someone else never has it.
+        node = self.registry.get(node_id)
+        if node is None or node.assignment != Assignment(job_id, epoch, stage_idx):
+            raise PermissionError("this node is not assigned to that stage")
+        if not 0 < step <= job.spec.steps:
+            raise InvalidCheckpoint(f"step {step} is outside this job")
+        plan = job.current.plans[stage_idx]
+        merged = self.checkpoints.store_stage(job_id, epoch, step, stage_idx, data, job.num_stages,
+                                              layers=(plan.layer_start, plan.layer_end))
         if merged is not None and step > job.row.last_checkpoint_step:
             job.row.last_checkpoint_step = step
             self.db.save(job.row)
@@ -199,7 +231,8 @@ class Coordinator:
         log.info("node %s registered: %s (%s, lends %.1f GB, %.1f TFLOPS, gpu %d%%)",
                  msg.node_id[:8], msg.name, d.chip, d.memory_contrib_bytes / 1e9, d.matmul_tflops,
                  msg.gpu_percent)
-        await send(Welcome(node_id=msg.node_id, heartbeat_interval_s=self.cfg.heartbeat_interval_s))
+        await send(Welcome(node_id=msg.node_id, heartbeat_interval_s=self.cfg.heartbeat_interval_s,
+                           node_token=state.token))
 
     async def on_disconnect(self, node_id: str) -> None:
         await self.recovery.on_node_lost(node_id, "disconnected")
@@ -209,10 +242,14 @@ class Coordinator:
             self.registry.heartbeat(node_id, msg.status)
         elif isinstance(msg, DrainNotice):
             await self.recovery.on_drain(node_id)
+        elif isinstance(msg, (StageReady, StepMetrics, StageFinished)) \
+                and not self._holds_stage(node_id, msg.job_id, msg.epoch, msg.stage_idx):
+            # Only the node planned for a stage may report on it; otherwise any
+            # node could start, bill or end a stranger's job.
+            log.warning("dropping %s from %s: not assigned to job %s epoch %d stage %d",
+                        type(msg).__name__, node_id[:8], msg.job_id, msg.epoch, msg.stage_idx)
         elif isinstance(msg, StageReady):
-            job = self.jobs.get(msg.job_id)
-            if job:
-                await self.scheduler.on_stage_ready(job, msg.epoch, msg.stage_idx)
+            await self.scheduler.on_stage_ready(self.jobs[msg.job_id], msg.epoch, msg.stage_idx)
         elif isinstance(msg, StepMetrics):
             await self._on_step(node_id, msg)
         elif isinstance(msg, StageFinished):
@@ -224,20 +261,41 @@ class Coordinator:
         else:
             log.warning("unexpected message from %s: %s", node_id[:8], type(msg).__name__)
 
+    def _holds_stage(self, node_id: str, job_id: str, epoch: int, stage_idx: int) -> bool:
+        job = self.jobs.get(job_id)
+        cur = job.current if job else None
+        return cur is not None and cur.epoch == epoch and any(
+            p.stage_idx == stage_idx and p.node_id == node_id for p in cur.plans)
+
     async def _on_step(self, node_id: str, msg: StepMetrics) -> None:
+        """Meter one step of one stage. handle() has already checked that the
+        sender holds the stage."""
         job = self.jobs.get(msg.job_id)
-        if job is None or job.current is None or job.current.epoch != msg.epoch:
+        cur = job.current if job else None
+        # "starting" counts as live: a stage's first metrics can overtake another
+        # stage's StageReady, which travels on a different socket.
+        if cur is None or cur.epoch != msg.epoch or cur.closed or job.row.status not in ACTIVE:
             return
+        # Each step is billed once per stage. Replays, steps the job does not
+        # have and unusable numbers would otherwise mint credits (or, for NaN,
+        # corrupt the books).
+        if not (cur.metered.get(msg.stage_idx, 0) < msg.step <= job.spec.steps) \
+                or not _sane_usage(msg.usage):
+            log.warning("ignoring step %d of job %s from %s: duplicate, out of range or bad usage",
+                        msg.step, msg.job_id, node_id[:8])
+            return
+        cur.metered[msg.stage_idx] = msg.step
         self.ledger.record_step(node_id, msg)
-        flops = float(msg.usage.flops)
-        acct = self.credits.job_account(job.id)
+        # The node earns exactly what the job was charged; the charge is capped
+        # at the reserve, and a job without one mints nothing.
+        charged = self.credits.consume_job(job.id, float(msg.usage.flops))
         node = self.registry.get(node_id)
         owner_id = (node.user_id if node and node.user_id else self.credits.owner_of(node_id))
-        if owner_id and acct is not None:
+        if owner_id and charged:
             owner = self.auth.get(owner_id)
             split = owner.grant_split if owner else 0
-            self.credits.contribute(owner_id, flops, split, node_id=node_id, job_id=msg.job_id)
-        if self.credits.consume_job(job.id, flops):
+            self.credits.contribute(owner_id, charged, split, node_id=node_id, job_id=msg.job_id)
+        if self.credits.job_exhausted(job.id):
             await self.cancel_job(job)
             job.row.error = "FLOP budget spent"
             self.db.save(job.row)

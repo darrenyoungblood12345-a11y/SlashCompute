@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 import mlx.core as mx
 import pytest
 from mlx_lm.utils import load_model
@@ -5,7 +7,7 @@ from mlx_lm.utils import load_model
 from slashcompute.jobs import LoraFinetuneSpec
 from slashcompute.pipeline.data import load_examples, make_batch
 from slashcompute.pipeline.local import build_compute, run_local_pipeline
-from slashcompute.pipeline.model_profile import profile_model
+from slashcompute.pipeline.model_profile import _local_headers, profile_model
 from slashcompute.pipeline.shard import load_shard
 from slashcompute.pipeline.stage import merge_checkpoints
 
@@ -20,7 +22,26 @@ def test_profile(tiny_model):
     p = profile_model(str(tiny_model))
     assert p.num_layers == 6 and p.tie_word_embeddings
     assert all(b > 0 for b in p.layer_bytes)
-    assert p.total_weight_bytes == sum(p.layer_bytes) + p.embed_bytes + p.head_bytes
+    # tied: head_bytes already includes the embedding, which one stage loads once
+    assert 0 < p.embed_bytes < p.head_bytes
+    assert p.total_weight_bytes == sum(p.layer_bytes) + p.head_bytes
+    on_disk = sum(t["data_offsets"][1] - t["data_offsets"][0]
+                  for t in _local_headers(tiny_model).values())
+    assert p.total_weight_bytes == on_disk
+
+
+def test_profile_counts_tied_embedding_once_per_stage(tiny_model):
+    p = profile_model(str(tiny_model))
+    layers = sum(p.layer_bytes)
+    assert p.stage_weight_bytes(0, 6) == layers + p.head_bytes
+    # split stages each load their own copy, so both ends still count it
+    assert p.stage_weight_bytes(0, 3) == sum(p.layer_bytes[:3]) + p.embed_bytes
+    assert p.stage_weight_bytes(3, 6) == sum(p.layer_bytes[3:]) + p.head_bytes
+    assert p.stage_weight_bytes(0, 3) + p.stage_weight_bytes(3, 6) == (
+        p.stage_weight_bytes(0, 6) + p.embed_bytes)
+    # untied: the head is its own tensor, so a single stage owns both in full
+    untied = replace(p, tie_word_embeddings=False)
+    assert untied.stage_weight_bytes(0, 6) == layers + p.embed_bytes + p.head_bytes
 
 
 def test_shards_compose_to_full_model(tiny_model):
@@ -43,6 +64,18 @@ def test_batches_deterministic(tiny_model, tiny_dataset):
     other = [make_batch(ex, s, 4, 0).inputs for s in range(4, 8)]
     assert any(o.shape != b1.inputs.shape or not mx.array_equal(o, b1.inputs).item() for o in other)
     assert b1.ntoks == int(b1.mask.sum().item()) > 0
+
+
+def test_examples_with_completion_truncated_away_are_dropped(tmp_path):
+    path = tmp_path / "d.jsonl"
+    path.write_text('{"tokens": [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19], "loss_start": 15}\n'
+                    '{"tokens": [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19], "loss_start": 5}\n')
+    ex = load_examples(path, None, 8)
+    assert [e.loss_start for e in ex] == [5]
+    assert make_batch(ex, 0, 1, 0).mask.tolist() == [[0, 0, 0, 0, 1, 1, 1, 1]]
+    path.write_text('{"tokens": [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19], "loss_start": 15}\n')
+    with pytest.raises(ValueError, match="no usable examples"):
+        load_examples(path, None, 8)
 
 
 async def test_pipeline_matches_single_stage_reference(tiny_model, tiny_dataset, tmp_path):

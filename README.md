@@ -43,7 +43,9 @@ No second machine needed. Starts a coordinator and two agents on localhost:
 uv run python scripts/run_local_cluster.py --agents 2
 ```
 
-In another terminal, submit a job (dataset path is on the coordinator machine):
+In another terminal on the coordinator machine, submit a job. `dataset_path` names a file on that
+machine and is only accepted from it (loopback); from any other machine, upload the dataset with
+`POST /jobs/upload` (the app does this for you):
 
 ```json
 {

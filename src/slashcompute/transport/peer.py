@@ -99,6 +99,10 @@ class TcpLink(Link):
             except ConnectionError as e:
                 raise LinkClosed(str(e)) from e
 
+    def abort(self) -> None:
+        """Drop the connection now (no flush); the read loop then reports it closed."""
+        self._writer.transport.abort()
+
     async def close(self) -> None:
         self._task.cancel()
         self._writer.close()
@@ -147,8 +151,14 @@ async def connect(host: str, port: int, hello: dict, timeout: float = 60.0,
                 raise
             await asyncio.sleep(retry_interval)
     link = TcpLink(reader, writer)
-    await link.send(Frame("hello", hello))
-    ack = await link.recv(timeout)
+    try:
+        await link.send(Frame("hello", hello))
+        ack = await link.recv(timeout)
+    except BaseException:
+        # Cancelled or failed mid-hello: no caller holds this connection yet, so nobody else
+        # would close it, and the peer may already have taken it as its upstream link.
+        link.abort()
+        raise
     if ack.kind != "hello_ack":
         await link.close()
         raise LinkClosed(f"peer rejected hello: {ack.meta}")
@@ -161,21 +171,34 @@ class LinkServer:
     def __init__(self, host: str, port: int, expect: dict) -> None:
         self.host, self.port, self.expect = host, port, expect
         self._accepted: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._claimed = False                 # accept() handed the link to the caller
+        self._pending: set[TcpLink] = set()   # connections still in the hello exchange
         self._server: Optional[asyncio.base_events.Server] = None
 
     async def start(self) -> "LinkServer":
+        # Bound first, served second: asyncio yields once after it starts serving, and a cancel
+        # landing there would drop the only reference to a live listener (the port then stays
+        # bound for the life of the process).
         self._server = await asyncio.start_server(self._on_conn, self.host, self.port,
-                                                  reuse_address=True)
+                                                  reuse_address=True, start_serving=False)
+        try:
+            await self._server.start_serving()
+        except BaseException:
+            self._server.close()
+            raise
         self.port = self._server.sockets[0].getsockname()[1]
         return self
 
     async def _on_conn(self, reader, writer) -> None:
         link = TcpLink(reader, writer)
+        self._pending.add(link)
         try:
             hello = await link.recv(10.0)
         except Exception:
             await link.close()
             return
+        finally:
+            self._pending.discard(link)
         ok = hello.kind == "hello" and all(hello.meta.get(k) == v for k, v in self.expect.items())
         if not ok or self._accepted.done():
             await link.send(Frame("hello_reject", {}))
@@ -185,9 +208,19 @@ class LinkServer:
         self._accepted.set_result(link)
 
     async def accept(self, timeout: Optional[float] = None) -> TcpLink:
-        return await asyncio.wait_for(asyncio.shield(self._accepted), timeout)
+        link = await asyncio.wait_for(asyncio.shield(self._accepted), timeout)
+        self._claimed = True
+        return link
 
     async def close(self) -> None:
-        if self._server is not None:
-            self._server.close()
-            await self._server.wait_closed()
+        if self._server is None:
+            return
+        self._server.close()                  # stops listening, so the port frees now
+        # wait_closed() waits for every connection, so close the ones nobody else
+        # will: half-done hellos and a link accepted after the caller gave up on it.
+        links = list(self._pending)
+        if self._accepted.done() and not self._accepted.cancelled() and not self._claimed:
+            links.append(self._accepted.result())
+        for link in links:
+            await link.close()
+        await self._server.wait_closed()

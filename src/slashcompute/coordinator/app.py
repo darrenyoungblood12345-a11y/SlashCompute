@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import logging
 import uuid
 from contextlib import asynccontextmanager
@@ -17,6 +18,7 @@ from slashcompute.community.credits import CreditError
 from slashcompute.community.http import _token, mount_community
 from slashcompute.common.config import EngineConfig
 from slashcompute.common.protocol import Register, dump, parse_agent_message
+from slashcompute.coordinator.checkpoints import InvalidCheckpoint
 from slashcompute.coordinator.core import Coordinator
 from slashcompute.coordinator.db import Verification
 from slashcompute.jobs import parse_spec
@@ -132,13 +134,29 @@ def create_app(cfg: EngineConfig, advertise: bool = False) -> FastAPI:
             raise HTTPException(404, "job not found")
         return job
 
+    def _on_coordinator(request: Request) -> bool:
+        """True only for a caller on the coordinator machine itself (loopback).
+        A forwarded request came through a proxy, which makes every caller look
+        local, so it never counts."""
+        if any(h in request.headers for h in ("forwarded", "x-forwarded-for", "x-real-ip")):
+            return False
+        try:
+            ip = ipaddress.ip_address(request.client.host if request.client else "")
+        except ValueError:
+            return False
+        return (getattr(ip, "ipv4_mapped", None) or ip).is_loopback
+
     @app.post("/jobs")
     async def submit_job(body: dict, request: Request,
                          authorization: Optional[str] = Header(default=None)):
         user = _user(request, authorization)
         try:
             spec = parse_spec(body)
-            job = core.submit(spec)
+            # dataset_path names a file on this machine: honoured only for a
+            # caller who is on it. Everyone else uploads (POST /jobs/upload).
+            job = core.submit(spec, allow_local_path=_on_coordinator(request))
+        except PermissionError as e:
+            raise HTTPException(403, str(e))
         except (ValidationError, ValueError, FileNotFoundError) as e:
             raise HTTPException(400, str(e))
         _reserve(user, job, body.get("max_flops"))
@@ -156,7 +174,7 @@ def create_app(cfg: EngineConfig, advertise: bool = False) -> FastAPI:
         max_flops: Optional[float] = Form(None),
         authorization: Optional[str] = Header(default=None),
     ):
-        uploads = cfg.home / "uploads"
+        uploads = core.uploads_dir
         uploads.mkdir(parents=True, exist_ok=True)
         raw = (dataset.filename or "train.jsonl").replace("\\", "/").split("/")[-1]
         dest = uploads / f"{uuid.uuid4().hex}_{raw}"
@@ -194,8 +212,24 @@ def create_app(cfg: EngineConfig, advertise: bool = False) -> FastAPI:
         return [r.model_dump() for r in core.ledger.job_records(job_id)]
 
     @app.get("/jobs/{job_id}/dataset")
-    async def get_dataset(job_id: str):
+    async def get_dataset(job_id: str, request: Request,
+                          authorization: Optional[str] = Header(default=None),
+                          x_node_token: Optional[str] = Header(default=None)):
         _job(job_id)
+        # Job ids are listed publicly, so knowing one must not be enough to
+        # read the training data. Allowed: the node running the job's first
+        # stage (the only one that loads the dataset), the job's owner, an
+        # admin, and the operator on the coordinator machine.
+        node = core.registry.by_token(x_node_token)
+        user = _user(request, authorization)
+        if not _on_coordinator(request):
+            if node is None and user is None:
+                raise HTTPException(401, "sign in, or present a node token (X-Node-Token)")
+            a = node.assignment if node else None
+            acct = core.credits.job_account(job_id)
+            if not ((a and a.job_id == job_id and a.stage_idx == 0)
+                    or (user and (user.admin or (acct and acct.user_id == user.id)))):
+                raise HTTPException(403, "not allowed to read this job's dataset")
         return FileResponse(core.dataset_path(job_id))
 
     @app.get("/jobs/{job_id}/checkpoints/{step}")
@@ -206,10 +240,20 @@ def create_app(cfg: EngineConfig, advertise: bool = False) -> FastAPI:
         return FileResponse(path)
 
     @app.post("/jobs/{job_id}/checkpoints/{step}")
-    async def put_checkpoint(job_id: str, step: int, epoch: int, stage: int, request: Request):
+    async def put_checkpoint(job_id: str, step: int, epoch: int, stage: int, request: Request,
+                             x_node_token: Optional[str] = Header(default=None)):
+        # Agents have no account; the token from their Welcome says which
+        # registered node is calling.
+        node = core.registry.by_token(x_node_token)
+        if node is None:
+            raise HTTPException(401, "a registered node's token is required (X-Node-Token)")
         data = await request.body()
         try:
-            core.on_checkpoint_upload(job_id, epoch, stage, step, data)
+            core.on_checkpoint_upload(node.node_id, job_id, epoch, stage, step, data)
+        except PermissionError as e:
+            raise HTTPException(403, str(e))
+        except InvalidCheckpoint as e:
+            raise HTTPException(400, str(e))
         except ValueError as e:
             raise HTTPException(409, str(e))
         return {"ok": True}

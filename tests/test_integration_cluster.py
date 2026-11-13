@@ -46,7 +46,10 @@ def _popen(args, env, log_file):
 
 
 @pytest.fixture
-def cluster(tmp_path):
+def cluster(tmp_path, request):
+    """In-process workers and no sampled replays, unless the test asks for the default
+    sandboxed workers with every step sampled (``indirect`` parametrize with "sandboxed")."""
+    sandboxed = getattr(request, "param", None) == "sandboxed"
     model = make_tiny_model(tmp_path / "model")
     data = make_tiny_dataset(tmp_path / "train.jsonl")
     port = _free_port()
@@ -54,11 +57,11 @@ def cluster(tmp_path):
     url = f"http://127.0.0.1:{port}"
     env = os.environ.copy()
     env.update({
-        "SLASHCOMPUTE_VERIFY_RATE": "0",
+        "SLASHCOMPUTE_VERIFY_RATE": "1" if sandboxed else "0",
         "SLASHCOMPUTE_SCHEDULER_TICK_S": "0.15",
         "SLASHCOMPUTE_CANARY_SIZE": "32",
         "SLASHCOMPUTE_STAGE_OVERHEAD_BYTES": "0",
-        "SLASHCOMPUTE_SANDBOX": "0",
+        "SLASHCOMPUTE_SANDBOX": "1" if sandboxed else "0",
         "SLASHCOMPUTE_LOG": "INFO",
     })
     procs = []
@@ -73,8 +76,8 @@ def cluster(tmp_path):
         for i, dp in enumerate((d0, d1)):
             procs.append(_popen(
                 [sys.executable, "-m", "slashcompute.agent.main", "start",
-                 "--url", url, "--localhost", "--no-sandbox",
-                 "--data-port", str(dp), "--gpu-percent", "100",
+                 "--url", url, "--localhost", "--sandbox" if sandboxed else "--no-sandbox",
+                 "--data-port", str(dp), "--gpu-percent", "25" if sandboxed else "100",
                  "--max-memory-gb", "4", "--home", str(tmp_path / f"agent{i}"),
                  "--name", f"it-{i}"],
                 env, tmp_path / f"agent{i}.log",
@@ -112,6 +115,8 @@ def test_two_agents_complete_lora_job(cluster):
         "seed": 7,
         "checkpoint_every": 3,
     }
+    # Submitting by path is allowed because this caller is on the coordinator
+    # machine (loopback); a remote one has to upload the dataset.
     r = httpx.post(f"{url}/jobs", json=spec, timeout=30)
     assert r.status_code == 200, r.text
     job_id = r.json()["id"]
@@ -144,3 +149,53 @@ def test_two_agents_complete_lora_job(cluster):
     for step, stages in by_step.items():
         if 0 in stages and 1 in stages:
             assert stages[0]["out_digest"] == stages[1]["in_digest"], (step, stages)
+
+
+@pytest.mark.parametrize("cluster", ["sandboxed"], indirect=True)
+def test_sampled_steps_of_a_sandboxed_worker_are_replayed(cluster):
+    """The default path end to end: the stage runs in a sandboxed worker process, the
+    coordinator samples its steps, the daemon gets each bundle from the worker over its
+    stdin/stdout pipe, and the other agent replays it. Before, every such fetch was answered
+    "bundle no longer held", so sandboxed work was never replayed."""
+    import shutil
+
+    if shutil.which("sandbox-exec") is None:
+        pytest.skip("sandbox-exec not available")
+    url, model, data, _, tmp_path = cluster
+    spec = {
+        "kind": "lora_finetune", "model": str(model), "dataset_path": str(data),
+        "steps": 6,                       # fewer than the ring holds: no step is evicted
+        "batch_size": 2, "microbatches": 1, "lora_rank": 4, "max_seq_len": 32,
+        "min_stages": 1, "max_stages": 1,  # one agent trains, the other is free to replay
+        "learning_rate": 1e-2, "seed": 7, "checkpoint_every": 6,
+    }
+    r = httpx.post(f"{url}/jobs", json=spec, timeout=30)
+    assert r.status_code == 200, r.text
+    job_id = r.json()["id"]
+
+    def replays():
+        return [v for v in httpx.get(f"{url}/verifications", timeout=5).json()
+                if v["kind"] == "replay" and v["job_id"] == job_id]
+
+    def settled():
+        job = httpx.get(f"{url}/jobs/{job_id}", timeout=5).json()
+        vs = replays()
+        return (job["status"] in ("completed", "failed", "cancelled") and len(vs) == 6
+                and all(v["status"] in ("passed", "failed", "error") for v in vs))
+
+    try:
+        _wait(settled, timeout=180)
+    except AssertionError:
+        logs = []
+        for name in ("coord.log", "agent0.log", "agent1.log"):
+            p = tmp_path / name
+            logs.append(f"===== {name} =====\n{p.read_text()[-4000:] if p.exists() else 'missing'}")
+        raise AssertionError(f"replays={replays()}\n" + "\n".join(logs))
+    assert httpx.get(f"{url}/jobs/{job_id}").json()["status"] == "completed"
+    assert "sandbox-exec" in (tmp_path / "agent0.log").read_text() + (tmp_path / "agent1.log").read_text()
+    by_status = {}
+    for v in replays():
+        by_status.setdefault(v["status"], []).append((v["step"], v["detail"]))
+    assert not by_status.get("failed"), by_status
+    # A step sampled as the stage ends may find the worker gone; the early ones must not.
+    assert len(by_status.get("passed", [])) >= 3, by_status

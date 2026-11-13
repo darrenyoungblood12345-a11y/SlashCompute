@@ -9,7 +9,7 @@ import signal
 import socket
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Awaitable, Callable, Coroutine, Optional
 
 import websockets
 from pydantic import BaseModel, ValidationError
@@ -17,9 +17,9 @@ from pydantic import BaseModel, ValidationError
 from slashcompute.agent.benchmark import benchmark
 from slashcompute.agent.http import CoordHTTP
 from slashcompute.agent.paths import AgentPaths, resolve_data_host
-from slashcompute.agent.sandbox import sandbox_enabled, wrap_command
+from slashcompute.agent.sandbox import sandbox_enabled, unavailable_reason, wrap_command
 from slashcompute.agent.verify import run_canary, run_replay
-from slashcompute.agent.worker import StageSession, WorkerContext, run_stage
+from slashcompute.agent.worker import StageSession, WorkerContext, bundle_path, run_stage
 from slashcompute.common.config import EngineConfig
 from slashcompute.common.discovery import discover
 from slashcompute.common.protocol import (
@@ -29,6 +29,12 @@ from slashcompute.common.protocol import (
 )
 
 log = logging.getLogger(__name__)
+
+# A sandboxed worker answers a bundle request between two compute calls (they run on its event
+# loop), so the answer can take as long as one of them. After this long the step is reported
+# as not held.
+BUNDLE_ANSWER_TIMEOUT_S = 60.0
+BUNDLE_STOP_GRACE_S = 2.0       # a worker being stopped gets this long to answer what was asked
 
 
 def resolve_coordinator(url: Optional[str]) -> str:
@@ -85,6 +91,26 @@ class AgentOptions:
         self.session_token = session_token or __import__("os").environ.get("SLASHCOMPUTE_SESSION")
 
 
+def _bundle_answer(asg: StageAssignment, asked: dict[int, asyncio.Future], raw: str) -> bool:
+    """Take a worker's stdout line if it is an answer to a bundle request (``worker.
+    _export_bundle``); such a line is never forwarded. It wakes the request it answers only
+    if it names the worker's own job and epoch and a step that was ``asked`` for: the worker
+    is the sandboxed side, so nothing else it prints may stand in for an answer."""
+    try:
+        msg = json.loads(raw)
+    except ValueError:
+        return False
+    if not isinstance(msg, dict) or msg.get("type") != "bundle":
+        return False
+    epoch, step = msg.get("epoch"), msg.get("step")
+    if (type(epoch) is int and type(step) is int
+            and (msg.get("job_id"), epoch) == (asg.job_id, asg.epoch)):
+        waiter = asked.pop(step, None)
+        if waiter is not None and not waiter.done():
+            waiter.set_result(msg.get("ok") is True)
+    return True
+
+
 class Daemon:
     def __init__(self, opt: AgentOptions) -> None:
         self.opt = opt
@@ -95,6 +121,11 @@ class Daemon:
         self._send_lock = asyncio.Lock()
         self._session: Optional[StageSession] = None
         self._proc: Optional[asyncio.subprocess.Process] = None
+        self._pump: Optional[asyncio.Task] = None    # forwards the sandboxed worker's stdout
+        self._proc_asg: Optional[StageAssignment] = None   # the stage the worker runs
+        # step -> the worker's answer to a bundle request that is still out
+        self._bundles: dict[int, asyncio.Future] = {}
+        self._tasks: set[asyncio.Task] = set()       # background work, kept referenced
         self._stop = asyncio.Event()
         self._draining = False
 
@@ -114,6 +145,8 @@ class Daemon:
 
     async def run(self) -> None:
         opt = self.opt
+        if opt.sandbox and (why := unavailable_reason()):
+            raise SystemExit(why)        # don't join a pool whose work we would refuse to run
         opt.paths.write_pid()
         self._write_status()
         loop = asyncio.get_running_loop()
@@ -142,6 +175,7 @@ class Daemon:
                 welcome = parse_coordinator_message(await ws.recv())
                 if not isinstance(welcome, Welcome):
                     raise SystemExit(f"expected welcome, got {type(welcome).__name__}")
+                opt.http.node_token = welcome.node_token
                 interval = welcome.heartbeat_interval_s
                 hb = asyncio.create_task(self._heartbeats(interval))
                 try:
@@ -178,11 +212,7 @@ class Daemon:
             await self._start_stage(msg)
         elif isinstance(msg, Drain):
             log.info("drain requested for job %s", msg.job_id)
-            if self._session:
-                self._session.request_drain()
-            if self._proc and self._proc.stdin:
-                self._proc.stdin.write(b'{"type":"drain"}\n')
-                await self._proc.stdin.drain()
+            await self._request_drain()
         elif isinstance(msg, CancelStage):
             log.info("cancel stage job %s epoch %d", msg.job_id, msg.epoch)
             await self._cancel_stage()
@@ -201,7 +231,16 @@ class Daemon:
         self._write_status()
         job_dir = self.opt.paths.job_dir(asg.job_id, asg.epoch)
         if self.opt.sandbox:
-            await self._start_sandboxed(asg, job_dir)
+            try:
+                await self._start_sandboxed(asg, job_dir)
+            except (RuntimeError, OSError) as e:     # sandbox gone, or the worker would not spawn
+                log.error("could not start the sandboxed worker: %s", e)
+                self.status, self.job_id, self.epoch = "idle", None, None
+                self._write_status()
+                await self.send(StageFinished(
+                    job_id=asg.job_id, epoch=asg.epoch, stage_idx=asg.stage_idx,
+                    reason="error", last_step=asg.resume_step, detail=str(e),
+                ))
             return
         session = StageSession()
         session.assignment = asg
@@ -228,6 +267,14 @@ class Daemon:
                 pass
             except Exception:
                 log.exception("worker crashed")
+            finally:
+                # emit() lets go of the stage on its StageFinished; this is for a stage that
+                # ended without one getting through (the send itself failed, say), which
+                # would otherwise hold this agent as busy for good.
+                if self._session is session:
+                    self._session = None
+                    self.status, self.job_id, self.epoch = "idle", None, None
+                    self._write_status()
 
         session.task = asyncio.create_task(_run())
         self._session = session
@@ -242,7 +289,9 @@ class Daemon:
             "data_port": self.opt.data_port,
             "gpu_percent": self.opt.gpu_percent,
             "node_id": self.opt.node_id,
+            "node_token": self.opt.http.node_token,
         }))
+        spec_path.chmod(0o600)  # holds the node token
         cmd = wrap_command(
             [sys.executable, "-m", "slashcompute.agent.worker", "--assignment", str(spec_path)],
             job_dir, self.opt.paths.root,
@@ -251,10 +300,11 @@ class Daemon:
         self._proc = await asyncio.create_subprocess_exec(
             *cmd, stdout=asyncio.subprocess.PIPE, stdin=asyncio.subprocess.PIPE,
         )
-        asyncio.create_task(self._pump_worker_stdout())
+        self._proc_asg, self._bundles = asg, {}
+        self._pump = asyncio.create_task(self._pump_worker_stdout())
 
     async def _pump_worker_stdout(self) -> None:
-        proc = self._proc
+        proc, asg, bundles = self._proc, self._proc_asg, self._bundles
         if proc is None or proc.stdout is None:
             return
         try:
@@ -270,7 +320,8 @@ class Daemon:
 
                     msg = parse_agent_message(raw)
                 except ValidationError:
-                    log.warning("worker stdout: %s", raw[:200])
+                    if not _bundle_answer(asg, bundles, raw):
+                        log.warning("worker stdout: %s", raw[:200])
                     continue
                 if isinstance(msg, StageReady):
                     self.status = "running"
@@ -282,41 +333,116 @@ class Daemon:
         finally:
             if proc.returncode is None:
                 await proc.wait()
-            self._proc = None
-            if self.status == "running":
-                self.status, self.job_id, self.epoch = "idle", None, None
-                self._write_status()
+            for waiter in bundles.values():
+                if not waiter.done():
+                    waiter.set_result(False)     # the worker is gone, and its ring with it
+            bundles.clear()
+            # Only for its own worker: by now a newer stage's worker may be the current one,
+            # and stop / drain / cancel must still be able to reach that one.
+            if self._proc is proc:
+                self._proc = None
+                if self.status == "running":
+                    self.status, self.job_id, self.epoch = "idle", None, None
+                    self._write_status()
+
+    async def _request_drain(self) -> None:
+        if self._session:
+            self._session.request_drain()
+        if self._proc and self._proc.stdin:
+            try:
+                self._proc.stdin.write(b'{"type":"drain"}\n')
+                await self._proc.stdin.drain()
+            except (BrokenPipeError, ConnectionResetError):
+                pass                             # the worker already exited
 
     async def _cancel_stage(self) -> None:
         if self._session:
             await self._session.cancel()
             self._session = None
         if self._proc:
-            self._proc.terminate()
-            try:
-                await asyncio.wait_for(self._proc.wait(), timeout=5)
-            except asyncio.TimeoutError:
-                self._proc.kill()
-            self._proc = None
+            proc = self._proc
+            if self._bundles:
+                # A sampled step asked for just before this stop: let the worker answer first.
+                await asyncio.wait(list(self._bundles.values()), timeout=BUNDLE_STOP_GRACE_S)
+            if proc.returncode is None:
+                proc.terminate()
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=5)
+                except asyncio.TimeoutError:
+                    proc.kill()
+            if self._proc is proc:
+                self._proc = None
         self.status, self.job_id, self.epoch = "idle", None, None
         self._write_status()
 
+    def _spawn(self, coro: Coroutine) -> None:
+        task = asyncio.create_task(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
     async def _on_fetch(self, msg: VerifyFetch) -> None:
-        dest = self.opt.paths.job_dir(msg.job_id, msg.epoch) / f"bundle_{msg.step}.safetensors"
-        ok = False
-        if self._session:
-            ok = self._session.save_bundle(msg.step, dest)
-        if not ok:
-            await self.send(VerifyBundleReady(
-                verify_id=msg.verify_id, job_id=msg.job_id, stage_idx=msg.stage_idx,
-                step=msg.step, error="bundle no longer held",
-            ))
+        dest = bundle_path(self.opt.paths.job_dir(msg.job_id, msg.epoch), msg.step)
+        asg = self._proc_asg
+        if self._proc is not None and (asg.job_id, asg.epoch) == (msg.job_id, msg.epoch):
+            # A sandboxed worker holds the ring (and only the stage that ran the step holds
+            # its bundle: another job's or epoch's worker is not asked). It is asked now, so
+            # the request is on its pipe before whatever follows this message (a CancelStage,
+            # say) is handled, but its answer is awaited in a task: it may be a compute call
+            # away, and this loop must keep reading.
+            answer = self._ask_worker_for_bundle(msg.step)
+
+            async def saved() -> bool:
+                try:
+                    return await asyncio.wait_for(asyncio.shield(answer), BUNDLE_ANSWER_TIMEOUT_S)
+                except asyncio.TimeoutError:
+                    return False
+
+            self._spawn(self._send_bundle(msg, dest, saved))
             return
-        self.opt.http.put_bytes(f"/verify/{msg.verify_id}/bundle", dest.read_bytes())
+        session = self._session
+
+        async def save() -> bool:
+            return bool(session and session.save_bundle(msg.step, dest))
+
+        await self._send_bundle(msg, dest, save)
+
+    def _ask_worker_for_bundle(self, step: int) -> asyncio.Future:
+        """Ask the sandboxed worker to save what it holds for ``step`` into its job directory.
+        The returned future gets the worker's answer from the stdout pump: True once the file
+        is there, False if the worker doesn't hold the step or exits first."""
+        answer = self._bundles.get(step)
+        if answer is not None:
+            return answer                        # already asked: one answer serves both
+        answer = asyncio.get_running_loop().create_future()
+        proc, asg = self._proc, self._proc_asg
+        if proc.returncode is not None or proc.stdin is None or self._pump is None or self._pump.done():
+            answer.set_result(False)             # nobody is left to answer
+            return answer
+        self._bundles[step] = answer
+        request = {"type": "bundle", "job_id": asg.job_id, "epoch": asg.epoch, "step": step}
+        proc.stdin.write(json.dumps(request).encode() + b"\n")
+        return answer
+
+    async def _send_bundle(self, msg: VerifyFetch, dest: Path,
+                           save: Callable[[], Awaitable[bool]]) -> None:
+        """Upload the bundle ``save`` puts at ``dest`` and tell the coordinator, also when
+        there is none."""
+        error = None
+        try:
+            if await save():
+                await asyncio.to_thread(self._upload, f"/verify/{msg.verify_id}/bundle", dest)
+            else:
+                error = "bundle no longer held"
+        except Exception as e:
+            log.exception("could not hand over the bundle of step %d", msg.step)
+            error = str(e) or type(e).__name__
         await self.send(VerifyBundleReady(
             verify_id=msg.verify_id, job_id=msg.job_id, stage_idx=msg.stage_idx,
-            step=msg.step, path=str(dest),
+            step=msg.step, path=None if error else str(dest), error=error,
         ))
+
+    def _upload(self, path: str, src: Path) -> None:
+        self.opt.http.put_bytes(path, src.read_bytes())
 
     async def _on_verify(self, msg: VerifyRequest) -> None:
         try:
@@ -352,6 +478,13 @@ class Daemon:
             try:
                 await asyncio.wait_for(self._session.task, timeout=self.opt.cfg.grace_period_s)
             except (asyncio.TimeoutError, asyncio.CancelledError, TypeError):
+                await self._cancel_stage()
+        elif self._proc:
+            # Sandboxed: the worker drains on a stdin line; the pump forwards its StageFinished.
+            await self._request_drain()
+            try:
+                await asyncio.wait_for(asyncio.shield(self._pump), timeout=self.opt.cfg.grace_period_s)
+            except (asyncio.TimeoutError, TypeError):
                 await self._cancel_stage()
         self._stop.set()
         if self._ws is not None:

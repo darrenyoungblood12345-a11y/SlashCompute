@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import secrets
 import time
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Optional
@@ -38,6 +39,9 @@ class NodeState:
     canary_passed: Optional[bool] = None
     last_canary: float = 0.0
     user_id: Optional[str] = None
+    # Issued in Welcome and presented on the node's HTTP requests. New for every
+    # registration, so taking over a node id does not take over its uploads.
+    token: str = field(default_factory=lambda: secrets.token_urlsafe(32), repr=False)
 
     @property
     def peer(self) -> PeerAddr:
@@ -62,6 +66,12 @@ class Registry:
 
     def get(self, node_id: str) -> Optional[NodeState]:
         return self.nodes.get(node_id)
+
+    def by_token(self, token: Optional[str]) -> Optional[NodeState]:
+        if not token:
+            return None
+        return next((n for n in self.nodes.values()
+                     if secrets.compare_digest(n.token.encode(), token.encode())), None)
 
     def remove(self, node_id: str) -> Optional[NodeState]:
         return self.nodes.pop(node_id, None)

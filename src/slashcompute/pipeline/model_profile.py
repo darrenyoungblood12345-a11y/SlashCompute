@@ -39,6 +39,10 @@ class ModelProfile:
             total += self.embed_bytes
         if end == n:
             total += self.head_bytes
+            if start == 0 and self.tie_word_embeddings:
+                # one stage owns both ends and holds the tied embedding once,
+                # but embed_bytes and head_bytes each include it
+                total -= self.embed_bytes
         return total
 
     @property

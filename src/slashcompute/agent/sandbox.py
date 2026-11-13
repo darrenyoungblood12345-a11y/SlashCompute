@@ -2,17 +2,15 @@
 
 from __future__ import annotations
 
-import logging
 import os
 import shutil
 import sys
 from pathlib import Path
 
-log = logging.getLogger(__name__)
-
 
 def profile_path() -> Path:
-    return Path(__file__).resolve().parents[3] / "sandbox" / "worker.sb"
+    # Shipped inside the package so wheel installs (and compute.app) have it.
+    return Path(__file__).resolve().with_name("worker.sb")
 
 
 def sandbox_enabled(flag: bool | None, cfg_default: bool) -> bool:
@@ -24,13 +22,25 @@ def sandbox_enabled(flag: bool | None, cfg_default: bool) -> bool:
     return bool(cfg_default) and sys.platform == "darwin"
 
 
-def wrap_command(cmd: list[str], job_dir: Path, agent_dir: Path) -> list[str]:
-    """Prefix ``cmd`` with sandbox-exec when the tool and profile exist."""
+def unavailable_reason() -> str:
+    """Why the sandbox cannot run here, else ""."""
     exe = shutil.which("sandbox-exec")
     profile = profile_path()
     if exe is None or not profile.is_file():
-        log.warning("sandbox requested but sandbox-exec/profile unavailable; running unsandboxed")
-        return cmd
+        return (
+            f"sandbox requested but unavailable (sandbox-exec={exe}, profile={profile}); "
+            "refusing to run the worker unsandboxed (pass --no-sandbox to opt out)"
+        )
+    return ""
+
+
+def wrap_command(cmd: list[str], job_dir: Path, agent_dir: Path) -> list[str]:
+    """Prefix ``cmd`` with sandbox-exec. Fails closed: never runs the worker unsandboxed."""
+    why = unavailable_reason()
+    if why:
+        raise RuntimeError(why)
+    exe = shutil.which("sandbox-exec")
+    profile = profile_path()
     tmp = Path(os.environ.get("TMPDIR") or "/tmp")
     return [
         exe, "-f", str(profile),
