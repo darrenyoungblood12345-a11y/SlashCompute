@@ -240,6 +240,14 @@ class Daemon:
                 pass
             except Exception:
                 log.exception("worker crashed")
+            finally:
+                # emit() lets go of the stage on its StageFinished; this is for a stage that
+                # ended without one getting through (the send itself failed, say), which
+                # would otherwise hold this agent as busy for good.
+                if self._session is session:
+                    self._session = None
+                    self.status, self.job_id, self.epoch = "idle", None, None
+                    self._write_status()
 
         session.task = asyncio.create_task(_run())
         self._session = session

@@ -52,6 +52,11 @@ class StageSession:
                 pass
 
 
+# How long a stage keeps dialing the next stage, and waits for the previous one to dial it.
+PEER_DIAL_TIMEOUT_S = 60.0
+PEER_ACCEPT_TIMEOUT_S = 180.0
+
+
 @dataclass
 class WorkerContext:
     assignment: StageAssignment
@@ -70,42 +75,57 @@ async def _peer_links(ctx: WorkerContext) -> tuple[Optional[Link], Optional[Link
     server = None
     prev = nxt = None
     # Downstream listens; upstream dials (see transport.peer).
-    if asg.stage_idx > 0:
-        server = await LinkServer(ctx.data_bind, ctx.data_port, hello).start()
-        log.info("listening for upstream on %s:%s", ctx.data_bind, server.port)
-    if asg.next_peer is not None:
-        log.info("dialing next stage %s:%s", asg.next_peer.host, asg.next_peer.port)
-        nxt = await connect(asg.next_peer.host, asg.next_peer.port, hello)
-    if server is not None:
-        prev = await server.accept(timeout=180.0)
-        log.info("upstream connected from %s", getattr(prev, "peername", "?"))
+    try:
+        if asg.stage_idx > 0:
+            server = await LinkServer(ctx.data_bind, ctx.data_port, hello).start()
+            log.info("listening for upstream on %s:%s", ctx.data_bind, server.port)
+        if asg.next_peer is not None:
+            log.info("dialing next stage %s:%s", asg.next_peer.host, asg.next_peer.port)
+            nxt = await connect(asg.next_peer.host, asg.next_peer.port, hello,
+                                timeout=PEER_DIAL_TIMEOUT_S)
+        if server is not None:
+            prev = await server.accept(timeout=PEER_ACCEPT_TIMEOUT_S)
+            log.info("upstream connected from %s", getattr(prev, "peername", "?"))
+    except BaseException:
+        # The caller only gets these once the handshake returns, so a cancel or a failure in
+        # the middle of it must let go of them here: a listener left bound keeps this agent's
+        # data port, and no later stage in this process (--no-sandbox) could listen on it.
+        # The listener first: closing it frees the port before anything below can wait.
+        if server is not None:
+            await server.close()
+        if nxt is not None:
+            await nxt.close()
+        raise
     return prev, nxt, server
 
 
 async def run_stage(ctx: WorkerContext, emit: OnMessage) -> StageResult:
     asg = ctx.assignment
     spec = asg.spec
-    ckdir = ctx.job_dir / "checkpoints"
-    ckdir.mkdir(parents=True, exist_ok=True)
-
-    dataset_path = None
-    if asg.dataset_url:
-        dataset_path = ctx.http.get_file(asg.dataset_url, ctx.job_dir / "dataset.jsonl")
-    resume_from = None
-    if asg.resume_step > 0 and asg.checkpoint_url:
-        resume_from = ctx.http.get_file(asg.checkpoint_url, ctx.job_dir / "resume.safetensors")
-
-    compute = build_compute(spec, asg.layer_start, asg.layer_end, asg.num_layers,
-                            ring_size=asg.verify_ring_size)
-    if resume_from is not None:
-        compute.load_checkpoint(resume_from)
-
-    profile = profile_model(spec.model)
-    recorder = UsageRecorder(profile, asg.layer_start, asg.layer_end)
-    examples = load_examples(dataset_path, spec.model, spec.max_seq_len) if dataset_path else None
-
-    prev, nxt, server = await _peer_links(ctx)
+    prev = nxt = server = None
+    # Setup is inside the try so a failure still reports StageFinished(error)
+    # rather than leaving the coordinator waiting on a stage that never starts.
     try:
+        ckdir = ctx.job_dir / "checkpoints"
+        ckdir.mkdir(parents=True, exist_ok=True)
+
+        dataset_path = None
+        if asg.dataset_url:
+            dataset_path = ctx.http.get_file(asg.dataset_url, ctx.job_dir / "dataset.jsonl")
+        resume_from = None
+        if asg.resume_step > 0 and asg.checkpoint_url:
+            resume_from = ctx.http.get_file(asg.checkpoint_url, ctx.job_dir / "resume.safetensors")
+
+        compute = build_compute(spec, asg.layer_start, asg.layer_end, asg.num_layers,
+                                ring_size=asg.verify_ring_size)
+        if resume_from is not None:
+            compute.load_checkpoint(resume_from)
+
+        profile = profile_model(spec.model)
+        recorder = UsageRecorder(profile, asg.layer_start, asg.layer_end)
+        examples = load_examples(dataset_path, spec.model, spec.max_seq_len) if dataset_path else None
+
+        prev, nxt, server = await _peer_links(ctx)
         await emit(StageReady(job_id=asg.job_id, epoch=asg.epoch, stage_idx=asg.stage_idx))
 
         async def on_step(s: StepStats) -> None:
