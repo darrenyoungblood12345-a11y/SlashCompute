@@ -10,6 +10,8 @@ import psutil
 
 from slashcompute.common.protocol import DeviceProfile
 
+MIN_CONTRIB_BYTES = 64 * 1024 * 1024
+
 
 def _sysctl(key: str) -> str | None:
     try:
@@ -55,13 +57,19 @@ def _mem_bandwidth_gbps(nbytes: int = 64 * 1024 * 1024) -> float:
     return (2.0 * nbytes) / max(dt, 1e-9) / 1e9
 
 
+def contrib_bytes(available: int, max_memory_bytes: int | None = None) -> int:
+    """Memory to lend: what is available (at least the floor), within the user's cap."""
+    contrib = max(available, MIN_CONTRIB_BYTES)
+    if max_memory_bytes is not None:
+        # the cap is the upper bound: apply it last so the floor cannot exceed it
+        contrib = min(contrib, max(int(max_memory_bytes), 0))
+    return contrib
+
+
 def benchmark(max_memory_bytes: int | None = None) -> DeviceProfile:
     total, available = _memory()
     working = max(int(total * 0.75), available)
-    contrib = available
-    if max_memory_bytes is not None:
-        contrib = min(contrib, int(max_memory_bytes))
-    contrib = max(contrib, 64 * 1024 * 1024)
+    contrib = contrib_bytes(available, max_memory_bytes)
     return DeviceProfile(
         chip=chip_name(),
         memory_total_bytes=total,
