@@ -239,21 +239,28 @@ class Launcher:
                 )
 
         agent_url = self.proxy_url(s) if s.mode == "host" else url
+        if not want_agent and self._agent_running():
+            request_stop(self.paths)
         if want_agent:
             if s.mode == "join" and not self.poll_health(url):
                 self.last_error = f"No coordinator at {url}."
                 raise LauncherError(self.last_error)
-            bound = self._bound_session()
-            rebind = bool(s.session_token) and s.session_token != bound
-            if self._agent_running() and rebind:
+            # A running agent keeps the URL, GPU limit and session it was started
+            # with, so restart it whenever any of those no longer match.
+            argv = self.agent_argv(agent_url, s.gpu_percent, s.session_token)
+            if self._agent_running() and self._read_agent_args() != argv:
                 request_stop(self.paths)
                 deadline = time.monotonic() + 3.0
                 while time.monotonic() < deadline and self._agent_running():
                     time.sleep(0.05)
+                if self._agent_running():
+                    self.last_error = (
+                        "Training agent is still stopping. Settings have not been applied; "
+                        "start again after its current work finishes."
+                    )
             if not self._agent_running():
-                self._spawn(self.agent_argv(agent_url, s.gpu_percent, s.session_token),
-                            self.log_dir / "agent.log")
-                self._write_bound_session(s.session_token)
+                self._spawn(argv, self.log_dir / "agent.log")
+                self._write_agent_args(argv)
 
         snap = self.snapshot(s)
         if snap.coordinator_up and "not answering" in (self.last_error or ""):
@@ -297,17 +304,21 @@ class Launcher:
             last_error=self.last_error,
         )
 
-    def _agent_session_path(self) -> Path:
-        return self.home / "agent.session"
+    def _agent_args_path(self) -> Path:
+        return self.home / "agent.args"
 
-    def _bound_session(self) -> str:
+    def _read_agent_args(self) -> list[str]:
         try:
-            return self._agent_session_path().read_text().strip()
-        except OSError:
-            return ""
+            return json.loads(self._agent_args_path().read_text())
+        except (OSError, ValueError):
+            return []
 
-    def _write_bound_session(self, token: str) -> None:
-        self._agent_session_path().write_text(token or "")
+    def _write_agent_args(self, argv: list[str]) -> None:
+        path = self._agent_args_path()
+        # argv can carry the session token: keep it private to the user
+        path.touch(mode=0o600)
+        path.chmod(0o600)
+        path.write_text(json.dumps(argv))
 
     def _agent_running(self) -> bool:
         pid = self.paths.read_pid()
