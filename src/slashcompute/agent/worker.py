@@ -5,9 +5,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
+
+import mlx.core as mx
 
 from slashcompute.agent.http import CoordHTTP
 from slashcompute.agent.throttle import make_pace
@@ -99,31 +103,69 @@ async def _peer_links(ctx: WorkerContext) -> tuple[Optional[Link], Optional[Link
     return prev, nxt, server
 
 
+# Stage setup blocks for as long as its downloads and the model load take (minutes on first
+# use), so it runs on this thread, not on the event loop: in an agent that runs stages
+# in-process that loop also sends the heartbeats, and the coordinator evicts a node that
+# misses them. One thread for the whole process: a setup whose stage was cancelled cannot be
+# interrupted, and the next stage's model load must not overlap with it in memory.
+_SETUP = ThreadPoolExecutor(max_workers=1, thread_name_prefix="stage-setup")
+
+
+def _setup_stage(ctx: WorkerContext, abandoned: threading.Event):
+    """The blocking part of stage setup, run on the setup thread. Returns None once the
+    stage is ``abandoned`` (cancelled while this was running)."""
+    asg = ctx.assignment
+    spec = asg.spec
+    ckdir = ctx.job_dir / "checkpoints"
+    ckdir.mkdir(parents=True, exist_ok=True)
+
+    dataset_path = None
+    if asg.dataset_url:
+        dataset_path = ctx.http.get_file(asg.dataset_url, ctx.job_dir / "dataset.jsonl")
+    resume_from = None
+    if asg.resume_step > 0 and asg.checkpoint_url:
+        resume_from = ctx.http.get_file(asg.checkpoint_url, ctx.job_dir / "resume.safetensors")
+    if abandoned.is_set():
+        return None                              # don't load a model nobody is waiting for
+
+    compute = build_compute(spec, asg.layer_start, asg.layer_end, asg.num_layers,
+                            ring_size=asg.verify_ring_size)
+    if resume_from is not None:
+        compute.load_checkpoint(resume_from)
+    # MLX evaluates a lazy array only on the thread that created it ("There is no
+    # Stream(gpu, N) in current thread"), and the steps run on the event loop's thread: so
+    # nothing built here may leave this thread unevaluated.
+    mx.eval(compute.shard.parameters(), compute.optimizer.state)
+
+    profile = profile_model(spec.model)
+    recorder = UsageRecorder(profile, asg.layer_start, asg.layer_end)
+    examples = load_examples(dataset_path, spec.model, spec.max_seq_len) if dataset_path else None
+    return ckdir, compute, recorder, examples
+
+
+def _upload_checkpoint(ctx: WorkerContext, step: int, path: Path) -> None:
+    asg = ctx.assignment
+    ctx.http.put_bytes(
+        f"/jobs/{asg.job_id}/checkpoints/{step}",
+        path.read_bytes(),
+        params={"epoch": asg.epoch, "stage": asg.stage_idx},
+    )
+
+
 async def run_stage(ctx: WorkerContext, emit: OnMessage) -> StageResult:
     asg = ctx.assignment
     spec = asg.spec
     prev = nxt = server = None
+    abandoned = threading.Event()
     # Setup is inside the try so a failure still reports StageFinished(error)
     # rather than leaving the coordinator waiting on a stage that never starts.
     try:
-        ckdir = ctx.job_dir / "checkpoints"
-        ckdir.mkdir(parents=True, exist_ok=True)
-
-        dataset_path = None
-        if asg.dataset_url:
-            dataset_path = ctx.http.get_file(asg.dataset_url, ctx.job_dir / "dataset.jsonl")
-        resume_from = None
-        if asg.resume_step > 0 and asg.checkpoint_url:
-            resume_from = ctx.http.get_file(asg.checkpoint_url, ctx.job_dir / "resume.safetensors")
-
-        compute = build_compute(spec, asg.layer_start, asg.layer_end, asg.num_layers,
-                                ring_size=asg.verify_ring_size)
-        if resume_from is not None:
-            compute.load_checkpoint(resume_from)
-
-        profile = profile_model(spec.model)
-        recorder = UsageRecorder(profile, asg.layer_start, asg.layer_end)
-        examples = load_examples(dataset_path, spec.model, spec.max_seq_len) if dataset_path else None
+        try:
+            ckdir, compute, recorder, examples = await asyncio.get_running_loop().run_in_executor(
+                _SETUP, _setup_stage, ctx, abandoned)
+        except asyncio.CancelledError:
+            abandoned.set()                      # the thread goes on; it stops at its next check
+            raise
 
         prev, nxt, server = await _peer_links(ctx)
         await emit(StageReady(job_id=asg.job_id, epoch=asg.epoch, stage_idx=asg.stage_idx))
@@ -136,11 +178,8 @@ async def run_stage(ctx: WorkerContext, emit: OnMessage) -> StageResult:
             ))
 
         async def on_checkpoint(step: int, path: Path) -> None:
-            ctx.http.put_bytes(
-                f"/jobs/{asg.job_id}/checkpoints/{step}",
-                path.read_bytes(),
-                params={"epoch": asg.epoch, "stage": asg.stage_idx},
-            )
+            # Off the loop like setup: a slow upload must not hold up heartbeats.
+            await asyncio.to_thread(_upload_checkpoint, ctx, step, path)
 
         runner = StageRunner(
             compute=compute, total_steps=spec.steps, microbatches=spec.microbatches,

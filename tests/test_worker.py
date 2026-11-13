@@ -4,12 +4,14 @@ here, the way a --no-sandbox agent runs it)."""
 import asyncio
 import json
 import socket
+import threading
+import time
 
 import pytest
 
 from slashcompute.agent import worker
 from slashcompute.agent.worker import WorkerContext, _peer_links, run_stage
-from slashcompute.common.protocol import PeerAddr, StageAssignment, StageFinished
+from slashcompute.common.protocol import PeerAddr, StageAssignment, StageFinished, StepMetrics
 from slashcompute.jobs import LoraFinetuneSpec
 from slashcompute.transport import LinkClosed, LinkServer, connect
 
@@ -287,3 +289,138 @@ async def test_in_process_daemon_frees_its_session_when_the_report_cannot_be_sen
     await daemon._handle(_assignment(dataset_url="/jobs/j/dataset"))
     await asyncio.wait_for(daemon._session.task, 30)
     assert daemon._session is None and daemon.status == "idle" and daemon.job_id is None
+
+
+# ------------------------------------------------------------ setup off the event loop
+
+
+class _Coordinator:
+    """Stands in for the coordinator's blob store (``CoordHTTP``): serves one dataset and one
+    resume checkpoint, keeps what is uploaded, and can hold a download up."""
+
+    def __init__(self, dataset=None, checkpoint=None, delay=0.0, gate=None):
+        self.dataset, self.checkpoint, self.delay, self.gate = dataset, checkpoint, delay, gate
+        self.started = threading.Event()
+        self.uploads = {}
+        self.threads = set()                           # the threads its calls blocked
+
+    def get_file(self, url, dest):
+        self.threads.add(threading.get_ident())
+        self.started.set()
+        if self.gate is not None:
+            assert self.gate.wait(60), "the test never let the download finish"
+        time.sleep(self.delay)
+        src = self.checkpoint if "checkpoint" in url else self.dataset
+        dest.write_bytes(src.read_bytes())
+        return dest
+
+    def put_bytes(self, path, data, params=None):
+        self.threads.add(threading.get_ident())
+        time.sleep(self.delay)
+        self.uploads[path] = data
+
+
+async def _ticks(counter):
+    while True:
+        counter.append(time.monotonic())
+        await asyncio.sleep(0.01)
+
+
+async def test_blocking_setup_does_not_block_the_event_loop(tmp_path, tiny_model):
+    """Setup (downloads, model load, dataset parsing) ran on the event loop, which in a
+    --no-sandbox agent also sends the heartbeats: a slow start got a healthy agent evicted."""
+    bad = tmp_path / "bad.jsonl"
+    bad.write_text('{"nope": 1}\n')                    # ends the stage right after the download
+    http = _Coordinator(dataset=bad, delay=0.6)
+    ticks = []
+    ticker = asyncio.create_task(_ticks(ticks))
+    sent, emit = _collector()
+    try:
+        with pytest.raises(ValueError):
+            await run_stage(_ctx(tmp_path, _assignment(tiny_model, dataset_url="/jobs/j/dataset"),
+                                 http=http), emit)
+    finally:
+        ticker.cancel()
+    assert len(ticks) >= 20, f"the loop ran {len(ticks)} times during a 0.6 s download"
+    assert threading.get_ident() not in http.threads
+    assert sent[0].reason == "error"
+
+
+async def test_heartbeats_keep_flowing_while_a_stage_sets_up(tmp_path, tiny_model, monkeypatch):
+    """The same seen from the coordinator: an in-process agent whose stage is still
+    downloading must keep sending heartbeats (its timeout is 20 s, a model download minutes)."""
+    daemon, sent = _in_process_daemon(tmp_path, monkeypatch)
+    bad = tmp_path / "bad.jsonl"
+    bad.write_text('{"nope": 1}\n')
+    daemon.opt.http.get_file = _Coordinator(dataset=bad, delay=1.0).get_file
+    beats = asyncio.create_task(daemon._heartbeats(0.05))
+    try:
+        await daemon._handle(_assignment(tiny_model, dataset_url="/jobs/j/dataset"))
+        await asyncio.wait_for(daemon._session.task, 60)
+    finally:
+        beats.cancel()
+    types = [m["type"] for m in sent]
+    loading = [m for m in sent[:types.index("stage_finished")]
+               if m["type"] == "heartbeat" and m["status"] == "loading"]
+    assert len(loading) >= 5, f"{len(loading)} heartbeats during a 1 s download"
+
+
+async def test_stage_cancelled_during_setup_ends_at_once_and_stops_loading(tmp_path, tiny_model, tiny_dataset,
+                                                                         monkeypatch):
+    """A cancel must not wait for the download the setup thread is in, and the abandoned
+    setup must not go on to load the model (the next stage needs that memory)."""
+    built = []
+    monkeypatch.setattr(worker, "build_compute", lambda *a, **kw: built.append(a))
+    gate = threading.Event()
+    http = _Coordinator(dataset=tiny_dataset, gate=gate)
+    sent, emit = _collector()
+    task = asyncio.create_task(run_stage(
+        _ctx(tmp_path, _assignment(tiny_model, dataset_url="/jobs/j/dataset"), http=http), emit))
+    try:
+        assert await asyncio.to_thread(http.started.wait, 30)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 5)            # not held up by the blocked download
+        assert [type(m) for m in sent] == [StageFinished] and sent[0].reason == "cancelled"
+    finally:
+        gate.set()
+    # The next stage's setup runs after the abandoned one, on the same thread.
+    sent, emit = _collector()
+    with pytest.raises(FileNotFoundError):
+        await asyncio.wait_for(run_stage(
+            _ctx(tmp_path, _assignment(tiny_model, epoch=2, dataset_url="/jobs/j/dataset"),
+                 http=_Coordinator(dataset=tmp_path / "missing.jsonl")), emit), 30)
+    assert not built and sent[0].reason == "error"
+
+
+async def test_stage_trains_and_resumes_after_setup_on_another_thread(tmp_path, tiny_model, tiny_dataset):
+    """MLX only evaluates a lazy array on the thread that created it, so what setup builds on
+    its thread (weights, adapters, a resumed optimizer state) must be usable on the event
+    loop, where the steps run. Also: the checkpoint upload must not run on the loop."""
+    from slashcompute.agent.worker import StageSession
+
+    http = _Coordinator(dataset=tiny_dataset)
+    asg = _assignment(tiny_model, dataset_url="/jobs/j/dataset").model_copy(update={
+        "num_stages": 1, "layer_end": 6, "checkpoint_every": 2})
+    asg.spec.batch_size, asg.spec.microbatches = 4, 2
+    ctx = _ctx(tmp_path, asg, http=http)
+    ctx.session = StageSession()
+    sent, emit = _collector()
+    result = await asyncio.wait_for(run_stage(ctx, emit), 120)
+    assert (result.reason, result.last_step) == ("done", 2)
+    assert [m.step for m in sent if isinstance(m, StepMetrics)] == [1, 2]
+    assert list(http.uploads) == ["/jobs/j/checkpoints/2"]
+    assert threading.get_ident() not in http.threads   # neither the download nor the upload
+    assert ctx.session.save_bundle(2, tmp_path / "bundle.safetensors")
+
+    # Epoch 2 resumes from that checkpoint for two more steps.
+    ckpt = tmp_path / "resume.safetensors"
+    ckpt.write_bytes(http.uploads["/jobs/j/checkpoints/2"])
+    asg2 = asg.model_copy(update={"epoch": 2, "resume_step": 2, "checkpoint_url": "/jobs/j/checkpoint"})
+    asg2.spec.steps = 4
+    http2 = _Coordinator(dataset=tiny_dataset, checkpoint=ckpt)
+    sent, emit = _collector()
+    result = await asyncio.wait_for(run_stage(_ctx(tmp_path, asg2, http=http2), emit), 120)
+    assert (result.reason, result.last_step) == ("done", 4)
+    assert [m.step for m in sent if isinstance(m, StepMetrics)] == [3, 4]
+    assert sent[-1].reason == "done"
