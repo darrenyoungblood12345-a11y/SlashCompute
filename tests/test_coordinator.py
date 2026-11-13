@@ -201,6 +201,89 @@ def test_adapter_export_leaves_nothing_behind_when_it_fails(tmp_path, tiny_model
     assert sorted(p.name for p in adapter.iterdir()) == ["adapter_config.json", "adapters.safetensors"]
 
 
+def _flush(core, agent):
+    """A node's messages are handled in order: once this heartbeat has landed,
+    so has everything the node sent before it."""
+    agent.send(P.Heartbeat(node_id=agent.node_id, status="draining"))
+    _wait(lambda: core.registry.get(agent.node_id).status == "draining")
+
+
+@pytest.fixture
+def victim_job(env):
+    """A two-stage job on two honest nodes, plus a connected node that was
+    never assigned to it (too small to be scheduled)."""
+    client, core, tiny_model, tiny_dataset, _ = env
+    agents = [FakeAgent(client, "node-a"), FakeAgent(client, "node-b", port=9001)]
+    try:
+        for x in agents:
+            x.pass_canary()
+        _wait(lambda: all(n.canary_passed for n in core.registry.nodes.values()))
+        spec = _spec(tiny_model, tiny_dataset, steps=50)
+        r = client.post("/jobs", json=json.loads(spec.model_dump_json()))
+        assert r.status_code == 200, r.text
+        job_id = r.json()["id"]
+        by_stage = {}
+        for x in agents:
+            m = x.recv()
+            assert isinstance(m, P.StageAssignment)
+            by_stage[m.stage_idx] = (m, x)
+        agents.append(FakeAgent(client, "intruder", mem=1 << 20, port=9002))
+        yield client, core, job_id, by_stage, agents[-1]
+    finally:
+        for x in agents:
+            try:
+                x.close()
+            except Exception:
+                pass
+
+
+def test_unassigned_node_cannot_ready_another_jobs_stage(victim_job):
+    client, core, job_id, by_stage, intruder = victim_job
+    for idx in by_stage:
+        intruder.send(P.StageReady(job_id=job_id, epoch=1, stage_idx=idx))
+    _flush(core, intruder)
+    assert core.jobs[job_id].current.ready == set()
+    assert client.get(f"/jobs/{job_id}").json()["status"] == "starting"
+
+    # A stage's own node may not vouch for the other stage either.
+    _, stage0_node = by_stage[0]
+    stage0_node.send(P.StageReady(job_id=job_id, epoch=1, stage_idx=1))
+    stage0_node.send(P.StageReady(job_id=job_id, epoch=1, stage_idx=0))
+    _flush(core, stage0_node)
+    assert core.jobs[job_id].current.ready == {0}
+    assert client.get(f"/jobs/{job_id}").json()["status"] == "starting"
+
+
+def test_unassigned_node_cannot_report_steps_for_another_job(victim_job):
+    client, core, job_id, by_stage, intruder = victim_job
+    intruder.send(P.StepMetrics(job_id=job_id, epoch=1, stage_idx=1, step=7, loss=0.01,
+                                in_digest="x", out_digest="y", usage=_usage()))
+    _flush(core, intruder)
+    job = client.get(f"/jobs/{job_id}").json()
+    assert job["progress_step"] == 0 and job["last_loss"] is None
+    assert client.get(f"/jobs/{job_id}/usage").json() == []
+
+
+@pytest.mark.parametrize("reason", ["error", "cancelled", "done", "drained"])
+def test_unassigned_node_cannot_finish_another_jobs_stage(victim_job, reason):
+    client, core, job_id, by_stage, intruder = victim_job
+    for idx in by_stage:
+        intruder.send(P.StageFinished(job_id=job_id, epoch=1, stage_idx=idx, reason=reason,
+                                      last_step=0, detail="pwned"))
+    _flush(core, intruder)
+    job = client.get(f"/jobs/{job_id}").json()
+    assert job["status"] == "starting" and job["recoveries"] == 0 and job["error"] is None
+    assert core.jobs[job_id].current.finished == {}
+    assert not core.jobs[job_id].current.closed
+    for _, node in by_stage.values():
+        assert core.registry.get(node.node_id).assignment is not None
+
+    # The assigned node's own report still counts.
+    m, node = by_stage[0]
+    node.send(P.StageFinished(job_id=job_id, epoch=1, stage_idx=0, reason="error", last_step=0))
+    _wait(lambda: client.get(f"/jobs/{job_id}").json()["recoveries"] == 1)
+
+
 def test_chain_mismatch_disputes(env):
     client, core, tiny_model, tiny_dataset, _ = env
     a, b = FakeAgent(client, "node-a"), FakeAgent(client, "node-b", port=9001)
