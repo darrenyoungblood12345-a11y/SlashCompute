@@ -66,15 +66,15 @@ class Grants:
             raise GrantError("Only approved grants can receive FLOPs.")
         if not from_pot and donor.id == g.author_id:
             raise GrantError("Donate to someone else's grant.")
+        flops = float(flops)
+        # The transfer also adds to the grant's total, atomically.
         if from_pot:
             if not donor.admin:
                 raise GrantError("Only an admin can allocate the community pot.", 403)
             self.credits.allocate_pot(g.author_id, g.id, flops)
         else:
             self.credits.donate(donor.id, g.author_id, g.id, flops)
-        g.received_flops += float(flops)
-        self.db.save(g)
-        return g
+        return self.get(g.id)
 
     def comment(self, user: User, grant_id: str, body: str) -> GrantComment:
         g = self.get(grant_id)

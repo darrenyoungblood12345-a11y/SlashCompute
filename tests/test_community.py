@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 
 import pytest
 from fastapi.testclient import TestClient
@@ -254,6 +255,111 @@ def test_pot_allocate_admin_only(core):
     core.grants.donate(admin, g.id, 10.0, from_pot=True)
     assert core.grants.get(g.id).received_flops == 10.0
     assert core.credits.balance(member.id) == 10.0
+
+
+def _race(n, fn):
+    """Run fn from n threads released together; return how many calls were not
+    refused. Anything other than a refusal is a real failure and re-raised."""
+    gate = threading.Barrier(n)
+    ok, crashed = [], []
+
+    def run():
+        gate.wait()
+        try:
+            fn()
+            ok.append(1)
+        except (CreditError, GrantError):
+            pass
+        except BaseException as e:  # noqa: BLE001 - surfaced on the main thread below
+            crashed.append(e)
+
+    threads = [threading.Thread(target=run) for _ in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    if crashed:
+        raise crashed[0]
+    return len(ok)
+
+
+def _approved_grant(core):
+    admin, _ = _account(core.auth, "admin@lan.test")
+    member, _ = _account(core.auth, "m@lan.test")
+    donor, _ = _account(core.auth, "d@lan.test")
+    g = core.grants.create(member, "Need compute", "A short paragraph about the need.", 1e6)
+    core.grants.review(admin, g.id, True)
+    return admin, member, donor, g
+
+
+def test_concurrent_spends_cannot_overdraw(core):
+    """Sixteen simultaneous spends of the whole balance: exactly one may win.
+    Repeated because a single round can pass by luck."""
+    admin, member, donor, g = _approved_grant(core)
+    rounds = 25
+    for i in range(rounds):
+        core.credits.contribute(donor.id, 10.0, 0)
+        assert _race(16, lambda: core.grants.donate(donor, g.id, 10.0)) == 1, f"round {i}"
+        assert core.credits.balance(donor.id) == 0.0
+    assert core.grants.get(g.id).received_flops == 10.0 * rounds
+    assert core.credits.balance(member.id) == 10.0 * rounds
+
+    for i in range(rounds):
+        core.credits.contribute(donor.id, 10.0, 100)  # all of it to the pot
+        assert _race(16, lambda: core.grants.donate(admin, g.id, 10.0, from_pot=True)) == 1, f"round {i}"
+        assert core.credits.balance(POT_ID) == 0.0
+    assert core.grants.get(g.id).received_flops == 20.0 * rounds
+    assert core.credits.balance(member.id) == 20.0 * rounds
+
+    for i in range(rounds):
+        jobs = iter(range(16))
+        have = core.credits.balance(member.id)
+        assert _race(16, lambda: core.credits.reserve_job(member.id, f"job-{i}-{next(jobs)}", have)) == 1
+        assert core.credits.balance(member.id) == 0.0
+        core.credits.contribute(member.id, 10.0, 0)
+
+
+def test_concurrent_donations_keep_the_grant_total(core):
+    """Every donation is affordable, so all must land on the grant's total."""
+    _, member, donor, g = _approved_grant(core)
+    rounds = 25
+    core.credits.contribute(donor.id, 16.0 * rounds, 0)
+    for i in range(rounds):
+        assert _race(16, lambda: core.grants.donate(donor, g.id, 1.0)) == 16
+        assert core.grants.get(g.id).received_flops == 16.0 * (i + 1), f"round {i}"
+    assert core.credits.balance(donor.id) == 0.0
+    assert core.credits.balance(member.id) == 16.0 * rounds
+
+
+def test_concurrent_consume_and_settle_keep_job_books_straight(core):
+    user, _ = _account(core.auth)
+    core.credits.contribute(user.id, 1000.0, 0)
+    for i in range(10):
+        job = f"job-{i}"
+        core.credits.reserve_job(user.id, job, 80.0)
+        # Every charge lands on the account: no lost updates to spent_flops.
+        assert _race(16, lambda: core.credits.consume_job(job, 1.0)) == 16
+        assert core.credits.job_account(job).spent_flops == 16.0
+        assert core.credits.lifetime_spent(user.id) == 16.0 * (i + 1)
+        # The leftover is released exactly once however many settles race.
+        _race(16, lambda: core.credits.settle_job(job))
+        assert core.credits.balance(user.id) == 1000.0 - 16.0 * (i + 1)
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf"), 0.0, -5.0])
+def test_non_finite_or_non_positive_spends_are_refused(core, bad):
+    admin, member, donor, g = _approved_grant(core)
+    core.credits.contribute(donor.id, 100.0, 50)
+    for spend in (lambda: core.grants.donate(donor, g.id, bad),
+                  lambda: core.grants.donate(admin, g.id, bad, from_pot=True),
+                  lambda: core.credits.reserve_job(donor.id, "job-bad", bad)):
+        with pytest.raises(CreditError):
+            spend()
+    assert core.credits.balance(donor.id) == 50.0
+    assert core.credits.balance(POT_ID) == 50.0
+    assert core.credits.balance(member.id) == 0.0
+    assert core.grants.get(g.id).received_flops == 0.0
+    assert core.credits.job_account("job-bad") is None
 
 
 def test_flag_and_comment(core):
